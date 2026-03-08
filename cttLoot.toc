@@ -1,0 +1,10 @@
+## Interface: 110100
+## Title: cttLoot
+## Notes: Paste SimC/raidbots TSV data and broadcast DPS deltas to your raid
+## Author: cttLoot
+## Version: 1.0.0
+## SavedVariables: cttLootDB
+
+cttLoot.lua
+cttLoot_DB.lua
+cttLoot_UI.lua
