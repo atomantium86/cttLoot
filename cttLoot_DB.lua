@@ -4,28 +4,32 @@
 
 cttLoot.DB = {}
 
-
-
 -- ── Derived lookups (built at load time, do not edit) ─────────────────────────
-cttLoot.DBByName  = {}  -- lowercase item name → { boss, raid }
-cttLoot.DBByBoss  = {}  -- boss name           → { itemName, ... }
-cttLoot.RaidOrder = {   -- canonical raid order for the dropdown
-  "The Voidspire",
-  "Dreamrift",
-  "March on Quel'Danas",
-}
+cttLoot.DBByName   = {}  -- lowercase item name → { boss }
+cttLoot.DBByBoss   = {}  -- boss name           → { itemName, ... }
+cttLoot.DBByItemId = {}  -- numeric item id     → { name, boss }
+                         -- ALL ids stored since same id can map to different items
 
 local function BuildDBLookups()
-  for _, entry in pairs(cttLoot.DB) do
+  for key, entry in pairs(cttLoot.DB) do
     local nameLower = (entry.name or ""):lower()
     if nameLower ~= "" then
-      cttLoot.DBByName[nameLower] = { boss = entry.boss, raid = entry.raid }
+      cttLoot.DBByName[nameLower] = { boss = entry.boss }
     end
     if entry.boss then
       if not cttLoot.DBByBoss[entry.boss] then
         cttLoot.DBByBoss[entry.boss] = {}
       end
       table.insert(cttLoot.DBByBoss[entry.boss], entry.name)
+    end
+    -- Extract numeric ID from compound key "id_name" — store every id
+    local numId = tonumber(key:match("^(%d+)_"))
+    if numId then
+      -- Store all mappings; if same id maps to multiple names, keep a list
+      if not cttLoot.DBByItemId[numId] then
+        cttLoot.DBByItemId[numId] = {}
+      end
+      table.insert(cttLoot.DBByItemId[numId], { name = entry.name, boss = entry.boss })
     end
   end
 end
@@ -34,23 +38,22 @@ BuildDBLookups()
 
 -- ── Public helpers ────────────────────────────────────────────────────────────
 
--- Returns { boss, raid } for a given item name, or nil if not in DB
+-- Returns { boss } for a given item name, or nil if not in DB
 function cttLoot:GetItemInfo(itemName)
   return self.DBByName[(itemName or ""):lower()]
 end
 
--- Returns a list of all boss names (in raid order)
+-- Returns a sorted list of all boss names that have DB entries
 function cttLoot:GetAllBosses()
   local seen   = {}
   local result = {}
-  for _, raid in ipairs(self.RaidOrder) do
-    for _, entry in pairs(self.DB) do
-      if entry.raid == raid and entry.boss and not seen[entry.boss] then
-        seen[entry.boss] = true
-        table.insert(result, { boss = entry.boss, raid = raid })
-      end
+  for _, entry in pairs(self.DB) do
+    if entry.boss and not seen[entry.boss] then
+      seen[entry.boss] = true
+      table.insert(result, entry.boss)
     end
   end
+  table.sort(result)
   return result
 end
 
@@ -60,31 +63,29 @@ function cttLoot:GetItemsForBoss(bossName)
 end
 
 -- ── In-game DB import (SavedVariables: cttLootDB.customDB) ───────────────────
--- Parses tab-separated lines: ID \t Name \t Boss [\t Raid]
--- Skips CATALYST / TOKEN / recipe rows. Merges into cttLoot.DB at login.
+-- Parses tab-separated lines: ID \t Name \t Boss
+-- Merges into cttLoot.DB at login.
 
 function cttLoot:ParseDBRaw(raw)
+    raw = raw:gsub("\r\n", "\n"):gsub("\r", "\n")
     local entries = {}
-    local defaultRaid = "The Voidspire"
     for line in (raw .. "\n"):gmatch("([^\n]*)\n") do
         line = line:match("^%s*(.-)%s*$")
         if line ~= "" then
+            local delim = line:find("\t") and "\t" or ","
             local cols = {}
-            for col in (line .. "\t"):gmatch("([^\t]*)\t") do
-                cols[#cols + 1] = col:match("^%s*(.-)%s*$")
+            local pattern = "([^" .. delim .. "]*)" .. delim
+            for col in (line .. delim):gmatch(pattern) do
+                cols[#cols + 1] = col:match("^%s*(.-)%s*$"):gsub('^"(.*)"$', '%1')
             end
-            local id   = tonumber(cols[1])
-            local name = cols[2] or ""
-            local boss = cols[3] or ""
-            local raid = (cols[4] and cols[4] ~= "") and cols[4] or defaultRaid
-            -- Skip invalid, catalyst, token, recipe rows
+            local id          = tonumber(cols[1])
+            local name        = cols[2] or ""
+            local boss        = cols[3] or ""
+            local encounterId = tonumber(cols[4])
             if id and name ~= "" and boss ~= "" then
-                local nameLow = name:lower()
-                if not (nameLow:find("catalyst") or nameLow:find("token")
-                    or nameLow:find("recipe") or nameLow:find("formula")
-                    or nameLow:find("pattern") or nameLow:find("schematic")) then
-                    entries[id] = { name = name, boss = boss, raid = raid }
-                end
+                -- Use id+name as key to avoid ID reuse across bosses
+                local key = tostring(id) .. "_" .. name
+                entries[key] = { name = name, boss = boss, encounterId = encounterId }
             end
         end
     end
@@ -95,24 +96,23 @@ end
 function cttLoot:MergeCustomDB()
     if not cttLootDB or not cttLootDB.customDB then return end
     local count = 0
-    for id, entry in pairs(cttLootDB.customDB) do
-        cttLoot.DB[id] = entry
+    for key, entry in pairs(cttLootDB.customDB) do
+        cttLoot.DB[key] = entry
         count = count + 1
     end
     if count > 0 then
-        -- Rebuild lookups to include custom entries
         wipe(cttLoot.DBByName)
         wipe(cttLoot.DBByBoss)
-        for _, entry in pairs(cttLoot.DB) do
+        wipe(cttLoot.DBByItemId)
+        for key, entry in pairs(cttLoot.DB) do
             local nameLower = (entry.name or ""):lower()
             if nameLower ~= "" then
-                cttLoot.DBByName[nameLower] = { boss = entry.boss, raid = entry.raid }
+                cttLoot.DBByName[nameLower] = { boss = entry.boss }
             end
             if entry.boss then
                 if not cttLoot.DBByBoss[entry.boss] then
                     cttLoot.DBByBoss[entry.boss] = {}
                 end
-                -- avoid duplicates
                 local found = false
                 for _, n in ipairs(cttLoot.DBByBoss[entry.boss]) do
                     if n == entry.name then found = true; break end
@@ -120,6 +120,13 @@ function cttLoot:MergeCustomDB()
                 if not found then
                     table.insert(cttLoot.DBByBoss[entry.boss], entry.name)
                 end
+            end
+            local numId = tonumber(key:match("^(%d+)_"))
+            if numId then
+                if not cttLoot.DBByItemId[numId] then
+                    cttLoot.DBByItemId[numId] = {}
+                end
+                table.insert(cttLoot.DBByItemId[numId], { name = entry.name, boss = entry.boss })
             end
         end
         cttLoot:Print(string.format("Loaded %d custom DB entries.", count))
