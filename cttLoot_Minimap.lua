@@ -3,7 +3,7 @@
 -- Saves position angle in cttLootDB.minimapAngle.
 -- Left-click toggles the main window; right-click opens/closes the settings drawer.
 
-local ICON       = "Interface\\Icons\\INV_Misc_QuestionMark"  -- fallback icon
+local ICON       = "Interface\\Icons\\INV_Misc_Bag_10"
 local BTN_SIZE   = 32
 local RADIUS     = 80   -- minimap orbit radius
 local DEFAULT_ANGLE = -30  -- degrees, 0 = right, -90 = top
@@ -69,7 +69,7 @@ local function Build()
         GameTooltip:SetOwner(self, "ANCHOR_LEFT")
         GameTooltip:AddLine("cttLoot", 0.24, 0.49, 0.75)
         GameTooltip:AddLine("Left-click: Toggle window", 0.9, 0.9, 0.9)
-        GameTooltip:AddLine("Right-click: Toggle settings drawer", 0.55, 0.55, 0.55)
+        GameTooltip:AddLine("Right-click: Check data sync", 0.55, 0.55, 0.55)
         GameTooltip:Show()
     end)
     btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -79,18 +79,11 @@ local function Build()
         if button == "LeftButton" and not dragging then
             cttLoot_UI:Toggle()
         elseif button == "RightButton" and not dragging then
-            -- Toggle the settings drawer
-            if cttLootFrame and cttLootFrame:IsShown() then
-                -- Access drawer state via the module-level toggle
-                if cttLoot_UI.ToggleDrawer then
-                    cttLoot_UI:ToggleDrawer()
-                end
-            else
-                cttLoot_UI:Toggle()
-            end
+            cttLoot:RunCheck()
         end
     end)
 
+    btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     -- Drag to reposition around minimap
     btn:RegisterForDrag("LeftButton")
     btn:SetScript("OnDragStart", function(self)

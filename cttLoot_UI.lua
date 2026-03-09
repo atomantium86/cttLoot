@@ -187,7 +187,44 @@ local function ScrollEB(parent, w, h)
     return sf, eb
 end
 
--- ── Close all dropdowns ───────────────────────────────────────────────────────
+-- ── Class color cache ─────────────────────────────────────────────────────────
+local classColorCache = {}  -- { ["playername"] = {r, g, b} }
+
+local function BuildClassColors()
+    classColorCache = {}
+    -- Always include the player themselves
+    local selfName = UnitName("player")
+    if selfName then
+        selfName = selfName:match("^([^%-]+)") or selfName
+        local _, classToken = UnitClass("player")
+        if classToken and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classToken] then
+            local c = RAID_CLASS_COLORS[classToken]
+            classColorCache[selfName:lower()] = { c.r, c.g, c.b }
+        end
+    end
+    -- Scan group members
+    local numMembers = GetNumGroupMembers()
+    local prefix = IsInRaid() and "raid" or "party"
+    for i = 1, numMembers do
+        local unit = prefix .. i
+        local name = UnitName(unit)
+        if name then
+            name = name:match("^([^%-]+)") or name
+            local _, classToken = UnitClass(unit)
+            if classToken and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classToken] then
+                local c = RAID_CLASS_COLORS[classToken]
+                classColorCache[name:lower()] = { c.r, c.g, c.b }
+            end
+        end
+    end
+end
+
+local function GetClassColor(playerName)
+    local key = playerName:lower():match("^([^%-]+)") or playerName:lower()
+    return classColorCache[key]
+end
+
+
 local function CloseDropdowns()
     bossDdOpen = false; itemDdOpen = false
     if bossDdFrame then bossDdFrame:Hide() end
@@ -215,7 +252,7 @@ local function MakeDrawerSection(parent, title, yOff)
 
     local arrow = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     arrow:SetPoint("RIGHT", hdr, "RIGHT", -6, 0)
-    arrow:SetTextColor(RGB(C.text_dim)); arrow:SetText("▶")
+    arrow:SetTextColor(RGB(C.text_dim)); arrow:SetText("+")
 
     -- divider under header
     local div = FlatTex(parent, "BACKGROUND", RGB(C.border))
@@ -236,8 +273,8 @@ local function MakeDrawerSection(parent, title, yOff)
 
     hdr:SetScript("OnClick", function()
         sec.open = not sec.open
-        if sec.open then body:Show(); arrow:SetText("▼")
-        else             body:Hide(); arrow:SetText("▶") end
+        if sec.open then body:Show(); arrow:SetText("-")
+        else             body:Hide(); arrow:SetText("+") end
         -- Restack other sections below
         cttLoot_UI:RepositionDrawer()
     end)
@@ -252,12 +289,12 @@ end
 
 -- Reposition all drawer sections after toggling one
 function cttLoot_UI:RepositionDrawer()
-    local y = -PAD
+    local y = -(TITLE_H + PAD + 2)
     for _, sec in ipairs(drawerSections) do
         sec.hdr:ClearAllPoints()
         sec.hdr:SetPoint("TOPLEFT",  drawer, "TOPLEFT",  PAD, y)
         sec.hdr:SetPoint("TOPRIGHT", drawer, "TOPRIGHT", -PAD, y)
-        y = y - PANEL_HDR - 1  -- header + divider
+        y = y - PANEL_HDR - 1
         if sec.open then
             sec.body:ClearAllPoints()
             sec.body:SetPoint("TOPLEFT",  drawer, "TOPLEFT",  PAD, y)
@@ -270,10 +307,11 @@ end
 -- Build the right-side drawer
 local function BuildDrawer(parent)
     local d = CreateFrame("Frame", nil, parent)
-    d:SetSize(DRAWER_W, WIN_H)
-    d:SetPoint("TOPRIGHT", parent, "TOPRIGHT", 0, 0)
+    d:SetPoint("TOPRIGHT", parent, "TOPRIGHT", 0, -(TITLE_H + 2))
     d:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", 0, 0)
+    d:SetWidth(DRAWER_W)
     d:SetFrameLevel(parent:GetFrameLevel() + 10)
+    d:EnableMouse(true)
     Bg(d, C.bg2)
     PixelBorder(d, C.border)
 
@@ -282,17 +320,17 @@ local function BuildDrawer(parent)
     dtb:SetHeight(TITLE_H)
     dtb:SetPoint("TOPLEFT"); dtb:SetPoint("TOPRIGHT")
     Bg(dtb, C.bg_title)
-    local accentLine = FlatTex(d, "ARTWORK", RGB(C.accent))
+    local accentLine = FlatTex(dtb, "ARTWORK", RGB(C.accent))
     accentLine:SetHeight(1)
     accentLine:SetPoint("TOPLEFT",  dtb, "BOTTOMLEFT",  0, 0)
     accentLine:SetPoint("TOPRIGHT", dtb, "BOTTOMRIGHT", 0, 0)
 
-    local dtitle = d:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    local dtitle = dtb:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     dtitle:SetPoint("LEFT", dtb, "LEFT", 10, 0)
     dtitle:SetTextColor(RGB(C.text_hi))
     dtitle:SetText("Settings")
 
-    local closeX = Btn(d, "X", 22, 18, "danger")
+    local closeX = Btn(dtb, "X", 22, 18, "danger")
     closeX:SetPoint("RIGHT", dtb, "RIGHT", -4, 0)
     closeX:SetScript("OnClick", function()
         d:Hide(); drawerOpen = false
@@ -305,15 +343,15 @@ end
 -- ── Import Parse Data section ─────────────────────────────────────────────────
 local function BuildImportSection(drawer_)
     drawerSections = {}  -- reset on build
-    local sec = MakeDrawerSection(drawer_, "Import Parse Data", -(TITLE_H + PAD + 2))
+    local sec = MakeDrawerSection(drawer, "Import Parse Data", -(TITLE_H + PAD + 2))
     sec.open = true
-    sec.arrow:SetText("▼")
+    sec.arrow:SetText("-")
     sec.body:Show()
     sec.body:SetHeight(138)
 
     local sf, eb = ScrollEB(sec.body, sec.body:GetWidth() - 4, 90)
     sf:SetPoint("TOPLEFT",  sec.body, "TOPLEFT",  2, -PAD)
-    sf:SetPoint("TOPRIGHT", sec.body, "TOPRIGHT", -2, -PAD)
+    sf:SetPoint("TOPRIGHT", sec.body, "TOPRIGHT", -20, -PAD)
     csvEB = eb
     -- Don't try to restore raw CSV into the editbox — data is loaded directly from lastData
 
@@ -325,13 +363,16 @@ local function BuildImportSection(drawer_)
         local data, err = cttLoot:ParseCSV(raw)
         if not data then cttLoot:Print("Parse error: "..(err or "?")); return end
         cttLoot:ApplyData(data)
-        -- Save parsed data directly — bypasses editbox size limits entirely
         cttLootDB.lastData = { itemNames=data.itemNames, playerNames=data.playerNames, matrix=data.matrix }
         cttLoot:Print(string.format("Loaded %d items x %d players.", #data.itemNames, #data.playerNames))
         cttLoot_UI:Refresh()
+        -- Auto-broadcast to group (or if loopback enabled for testing)
+        if IsInRaid() or IsInGroup() or cttLoot.loopback then
+            cttLoot:Broadcast()
+        end
     end)
 
-    local sendBtn = Btn(sec.body, "Send to Raid", 88, 20)
+    local sendBtn = Btn(sec.body, "Resend to Raid", 106, 20)
     sendBtn:SetPoint("LEFT", loadBtn, "RIGHT", 4, 0)
     sendBtn:SetScript("OnClick", function()
         if #cttLoot.itemNames == 0 then cttLoot:Print("Load data first."); return end
@@ -361,7 +402,7 @@ local function BuildDBSection()
 
     local sf, eb = ScrollEB(sec.body, sec.body:GetWidth() - 4, 64)
     sf:SetPoint("TOPLEFT",  sec.body, "TOPLEFT",  2, -PAD)
-    sf:SetPoint("TOPRIGHT", sec.body, "TOPRIGHT", -2, -PAD)
+    sf:SetPoint("TOPRIGHT", sec.body, "TOPRIGHT", -20, -PAD)
     dbEB = eb
 
     local impBtn = Btn(sec.body, "Import", 64, 20, "primary")
@@ -497,6 +538,7 @@ local function BuildFilterBar(parent, topAnchor)
     bossDdFrame:SetWidth(218)
     bossDdFrame:SetPoint("TOPLEFT", bossBtn, "BOTTOMLEFT", 0, -2)
     bossDdFrame:SetFrameLevel(bar:GetFrameLevel() + 20)
+    bossDdFrame:EnableMouse(true)
     Bg(bossDdFrame, C.bg2)
     PixelBorder(bossDdFrame, C.accent)
     bossDdFrame:Hide()
@@ -506,6 +548,7 @@ local function BuildFilterBar(parent, topAnchor)
     itemDdFrame:SetWidth(238)
     itemDdFrame:SetPoint("TOPLEFT", itemBtn, "BOTTOMLEFT", 0, -2)
     itemDdFrame:SetFrameLevel(bar:GetFrameLevel() + 20)
+    itemDdFrame:EnableMouse(true)
     Bg(itemDdFrame, C.bg2)
     PixelBorder(itemDdFrame, C.accent)
     itemDdFrame:Hide()
@@ -540,7 +583,7 @@ end
 local function BuildCardArea(parent, topAnchor)
     cardScrollF = CreateFrame("ScrollFrame", nil, parent, "UIPanelScrollFrameTemplate")
     cardScrollF:SetPoint("TOPLEFT",     topAnchor, "BOTTOMLEFT",  0, -PAD)
-    cardScrollF:SetPoint("BOTTOMRIGHT", parent,    "BOTTOMRIGHT", -18, PAD)
+    cardScrollF:SetPoint("BOTTOMRIGHT", parent,    "BOTTOMRIGHT", -22, PAD)
 
     Bg(cardScrollF, C.bg3)
     PixelBorder(cardScrollF, C.border)
@@ -567,11 +610,11 @@ end
 local function GetItemPool()
     local pool = {}
     local source
-    if cttLoot_UI.lootFilter then
-        source = cttLoot_UI.lootFilter
-    elseif cttLoot_UI.selectedItem then
-        -- single-item view: only one item
+    if cttLoot_UI.selectedItem then
+        -- single-item detail view always takes priority
         return { cttLoot_UI.selectedItem }
+    elseif cttLoot_UI.lootFilter then
+        source = cttLoot_UI.lootFilter
     elseif cttLoot_UI.selectedBoss then
         source = cttLoot_UI:GetVisibleItemsForBoss(cttLoot_UI.selectedBoss)
     else
@@ -583,9 +626,13 @@ local function GetItemPool()
     return pool
 end
 
+-- Per-player best item lookup (populated before each grid render)
+local playerBestItem = {}
+
 -- Build one card frame for `itemName` at position (ox, oy) relative to cardContent
 -- Returns the card frame (or nil) and its total height.
-local function MakeCard(itemName, ox, oy, limit)
+local function MakeCard(itemName, ox, oy, limit, cardW)
+    cardW = cardW or CARD_W
     -- Find column index
     local ci = nil
     for i, n in ipairs(cttLoot.itemNames) do
@@ -622,7 +669,7 @@ local function MakeCard(itemName, ox, oy, limit)
     local cardH    = hdrH + #entries * ROW_H + 2
 
     local card = CreateFrame("Frame", nil, cardContent)
-    card:SetSize(CARD_W, cardH)
+    card:SetSize(cardW, cardH)
     card:SetPoint("TOPLEFT", cardContent, "TOPLEFT", ox, -oy)
 
     Bg(card, C.bg2)
@@ -657,10 +704,13 @@ local function MakeCard(itemName, ox, oy, limit)
     hdr:SetScript("OnClick", function()
         CloseDropdowns()
         if cttLoot_UI.selectedItem == itemName then
-            -- clicking same item header → go back to overview
+            -- clicking same item header → go back to previous view
             cttLoot_UI.selectedItem = nil
-            if itemDdLabel then itemDdLabel:SetText("Item") end
-            if itemClearBtn then itemClearBtn:Hide() end
+            -- only reset item dropdown if we're not in loot filter mode
+            if not cttLoot_UI.lootFilter then
+                if itemDdLabel then itemDdLabel:SetText("Item") end
+                if itemClearBtn then itemClearBtn:Hide() end
+            end
         else
             cttLoot_UI.selectedItem = itemName
             if itemDdLabel then itemDdLabel:SetText(itemName) end
@@ -673,10 +723,16 @@ local function MakeCard(itemName, ox, oy, limit)
     for i, e in ipairs(entries) do
         local ry = hdrH + (i-1) * ROW_H
 
-        -- Alternating row tint (matching tbody tr:nth-child(even))
-        if i % 2 == 0 then
+        -- Gold highlight if this is the player's best item
+        local isBest = not e.isCat and (playerBestItem[e.player] == itemName)
+        if isBest then
+            local bestBg = FlatTex(card, "BACKGROUND", 1, 0.82, 0.1, 0.12)
+            bestBg:SetSize(cardW, ROW_H)
+            bestBg:SetPoint("TOPLEFT", card, "TOPLEFT", 0, -ry)
+        elseif i % 2 == 0 then
+            -- Alternating row tint (matching tbody tr:nth-child(even))
             local rowBg = FlatTex(card, "BACKGROUND", 1, 1, 1, 0.025)
-            rowBg:SetSize(CARD_W, ROW_H)
+            rowBg:SetSize(cardW, ROW_H)
             rowBg:SetPoint("TOPLEFT", card, "TOPLEFT", 0, -ry)
         end
 
@@ -696,23 +752,27 @@ local function MakeCard(itemName, ox, oy, limit)
         nameFS:SetSize(COL_NAME, ROW_H)
         nameFS:SetPoint("TOPLEFT", card, "TOPLEFT", COL_RANK + 2, -ry)
         nameFS:SetJustifyH("LEFT"); nameFS:SetJustifyV("MIDDLE")
+        local classColor = GetClassColor(e.player)
         if e.isCat then
             nameFS:SetText(e.player .. " " .. Clr(C.catalyst, "(cat)"))
-            nameFS:SetTextColor(RGB(C.text))
+            if classColor then nameFS:SetTextColor(classColor[1], classColor[2], classColor[3])
+            else nameFS:SetTextColor(RGB(C.text)) end
         else
-            nameFS:SetTextColor(RGB(C.text))
+            if classColor then nameFS:SetTextColor(classColor[1], classColor[2], classColor[3])
+            else nameFS:SetTextColor(RGB(C.text)) end
             nameFS:SetText(e.player)
         end
 
         -- Bar background (.ov-bar-wrap)
+        local dynBarW = cardW - COL_RANK - COL_NAME - COL_DPS - 10
         local barBg = FlatTex(card, "BACKGROUND", 1, 1, 1, 0.06)
-        barBg:SetSize(BAR_W, BAR_H)
+        barBg:SetSize(dynBarW, BAR_H)
         barBg:SetPoint("TOPLEFT", card, "TOPLEFT",
             COL_RANK + COL_NAME + 2, -ry - (ROW_H - BAR_H) / 2)
 
         -- Bar fill (.ov-bar)
         local barPct = math.max(0.01, math.abs(e.dps) / maxAbs)
-        local fillW  = math.max(2, math.floor(barPct * BAR_W))
+        local fillW  = math.max(2, math.floor(barPct * dynBarW))
         local barFill = FlatTex(card, "ARTWORK", 1, 1, 1, 0.85)
         barFill:SetSize(fillW, BAR_H)
         barFill:SetPoint("TOPLEFT", barBg, "TOPLEFT", 0, 0)
@@ -763,9 +823,33 @@ local function ClearCards()
     cardContent:SetHeight(1)
 end
 
+-- Per-player best item: { ["playername"] = "itemName" }
+local function BuildPlayerBestItems()
+    playerBestItem = {}
+    for r, player in ipairs(cttLoot.playerNames) do
+        local row = cttLoot.matrix[r]
+        if row then
+            local bestVal, bestItem = nil, nil
+            for i, itemName in ipairs(cttLoot.itemNames) do
+                if not IsCatalyst(itemName) then
+                    local v = row[i]
+                    if v and (bestVal == nil or v > bestVal) then
+                        bestVal = v
+                        bestItem = itemName
+                    end
+                end
+            end
+            if bestItem then
+                playerBestItem[player] = bestItem
+            end
+        end
+    end
+end
+
 -- Re-lay out the card grid
 local function PopulateGrid()
     ClearCards()
+    BuildPlayerBestItems()
 
     local pool = GetItemPool()
 
@@ -787,14 +871,15 @@ local function PopulateGrid()
     -- In single-item view show all rows; otherwise cap at 10 (matching HTML limit 10)
     local rowLimit = cttLoot_UI.selectedItem and 0 or 10
 
-    local gridW = cardScrollF:GetWidth() - 4
-    local cols  = math.max(1, math.floor((gridW + CARD_GAP) / (CARD_W + CARD_GAP)))
+    local gridW    = cardScrollF:GetWidth() - 4
+    local cardW    = cttLoot_UI.selectedItem and (gridW - PAD * 2) or CARD_W
+    local cols     = cttLoot_UI.selectedItem and 1 or math.max(1, math.floor((gridW + CARD_GAP) / (CARD_W + CARD_GAP)))
     local col, totalH, rowMaxH = 0, PAD, 0
 
     for _, name in ipairs(pool) do
-        local ox = PAD + col * (CARD_W + CARD_GAP)
+        local ox = PAD + col * (cardW + CARD_GAP)
         local oy = totalH
-        local card, cardH = MakeCard(name, ox, oy, rowLimit)
+        local card, cardH = MakeCard(name, ox, oy, rowLimit, cardW)
         if card then
             table.insert(cardPool, card)
             activeCards = activeCards + 1
@@ -856,6 +941,12 @@ local function BuildDdSearchAndList(ddFrame, ddW)
     placeholder:SetPoint("LEFT", searchEB, "LEFT", 6, 0)
 
     searchEB:SetScript("OnTextChanged", function(s)
+        placeholder:SetShown(s:GetText() == "")
+    end)
+    searchEB:SetScript("OnEditFocusGained", function()
+        placeholder:Hide()
+    end)
+    searchEB:SetScript("OnEditFocusLost", function(s)
         placeholder:SetShown(s:GetText() == "")
     end)
 
@@ -1067,6 +1158,7 @@ end
 
 function cttLoot_UI:Refresh()
     if not window then return end
+    BuildClassColors()
     PopulateGrid()
 end
 
@@ -1088,14 +1180,32 @@ end
 function cttLoot_UI:Build()
     -- ── Main window ──
     window = CreateFrame("Frame", "cttLootFrame", UIParent)
-    window:SetSize(WIN_W, WIN_H)
-    window:SetPoint("CENTER")
+
+    -- Restore saved size or use defaults
+    local savedW = cttLootDB and cttLootDB.windowW or WIN_W
+    local savedH = cttLootDB and cttLootDB.windowH or WIN_H
+    window:SetSize(savedW, savedH)
+
+    -- Restore saved position or center
+    if cttLootDB and cttLootDB.windowX and cttLootDB.windowY and cttLootDB.windowPoint then
+        window:SetPoint(cttLootDB.windowPoint, UIParent, cttLootDB.windowRelPoint or cttLootDB.windowPoint, cttLootDB.windowX, cttLootDB.windowY)
+    else
+        window:SetPoint("CENTER")
+    end
+
     window:SetMovable(true); window:SetResizable(true)
     window:SetResizeBounds(500, 380, 1600, 1100)
     window:EnableMouse(true)
     window:RegisterForDrag("LeftButton")
     window:SetScript("OnDragStart", window.StartMoving)
-    window:SetScript("OnDragStop",  window.StopMovingOrSizing)
+    window:SetScript("OnDragStop", function()
+        window:StopMovingOrSizing()
+        local point, _, relPoint, x, y = window:GetPoint(1)
+        cttLootDB.windowPoint  = point
+        cttLootDB.windowRelPoint = relPoint
+        cttLootDB.windowX = x
+        cttLootDB.windowY = y
+    end)
     window:SetFrameStrata("HIGH"); window:SetFrameLevel(100)
     Bg(window, C.bg)
     PixelBorder(window, C.border)
@@ -1113,26 +1223,33 @@ function cttLoot_UI:Build()
     accentLine:SetPoint("TOPLEFT",  titleBar, "BOTTOMLEFT",  0, 0)
     accentLine:SetPoint("TOPRIGHT", titleBar, "BOTTOMRIGHT", 0, 0)
 
-    -- Title text: "cttLoot · Player DPS Delta Viewer"
-    local titleFS = window:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    -- Title text
+    local titleFS = titleBar:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     titleFS:SetPoint("LEFT", titleBar, "LEFT", 12, 0)
     titleFS:SetTextColor(RGB(C.text_hi))
-    titleFS:SetText("cttLoot  "..Clr(C.accent, "·").."  Player DPS Delta Viewer")
+    titleFS:SetText("cttLoot  "..Clr(C.accent, "·").."  Loot Parser")
 
-    -- ⚙ Cog button (right side of title bar, opens drawer)
-    local cogBtn = Btn(window, "Settings", 60, 20)
-    cogBtn:SetPoint("RIGHT", titleBar, "RIGHT", -4, 0)
+    -- Close button (plain X)
+    local closeBtn = Btn(window, "X", 22, 18, "danger")
+    closeBtn:SetPoint("RIGHT", titleBar, "RIGHT", -4, 0)
+    closeBtn:SetScript("OnClick", function()
+        window:Hide(); CloseDropdowns()
+        if drawer then drawer:Hide(); drawerOpen = false end
+    end)
+
+    -- Settings button (same height as X, left of close button)
+    local cogBtn = Btn(window, "Settings", 60, 18)
+    cogBtn:SetPoint("RIGHT", closeBtn, "LEFT", -2, 0)
     cogBtn:SetScript("OnClick", function()
         drawerOpen = not drawerOpen
         if drawerOpen then drawer:Show() else drawer:Hide() end
     end)
 
-    -- Close button (plain X — ✕ renders as a box in WoW fonts)
-    local closeBtn = Btn(window, "X", 22, 18, "danger")
-    closeBtn:SetPoint("RIGHT", cogBtn, "LEFT", -2, 0)
-    closeBtn:SetScript("OnClick", function()
-        window:Hide(); CloseDropdowns()
-        if drawer then drawer:Hide(); drawerOpen = false end
+    -- Check button (left of Settings)
+    local checkBtn = Btn(window, "Check", 50, 18)
+    checkBtn:SetPoint("RIGHT", cogBtn, "LEFT", -2, 0)
+    checkBtn:SetScript("OnClick", function()
+        cttLoot:RunCheck()
     end)
 
     -- Resize grip
@@ -1145,9 +1262,15 @@ function cttLoot_UI:Build()
     grip:SetScript("OnMouseDown", function() window:StartSizing("BOTTOMRIGHT") end)
     grip:SetScript("OnMouseUp",   function()
         window:StopMovingOrSizing()
+        cttLootDB.windowW = math.floor(window:GetWidth())
+        cttLootDB.windowH = math.floor(window:GetHeight())
+        local point, _, relPoint, x, y = window:GetPoint(1)
+        cttLootDB.windowPoint    = point
+        cttLootDB.windowRelPoint = relPoint
+        cttLootDB.windowX = x
+        cttLootDB.windowY = y
         if cardScrollF then
-            -- resize scroll area to fit new window dimensions
-            cardScrollF:SetPoint("BOTTOMRIGHT", window, "BOTTOMRIGHT", -18, PAD)
+            cardScrollF:SetPoint("BOTTOMRIGHT", window, "BOTTOMRIGHT", -22, PAD)
             if cardContent then cardContent:SetWidth(cardScrollF:GetWidth()) end
         end
         cttLoot_UI:Refresh()
