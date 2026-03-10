@@ -107,34 +107,36 @@ function cttLoot:ParseCSV(raw)
     end
 
     if #lines < 2 then
-        return nil, "Need at least a header row and one player row."
+        return nil, "Need at least a header row and one data row."
     end
 
     local delim = lines[1]:find("\t") and "\t" or ","
 
+    -- Layout: row 1 col A = empty, cols B+ = player names
+    --         rows 2+  col A = item name, cols B+ = delta values
     local headerCells = splitRow(lines[1], delim)
-    local rawItemNames, rawItemIdxs = {}, {}
+    local rawPlayerNames, rawPlayerIdxs = {}, {}
     for i = 2, #headerCells do
         if headerCells[i] ~= "" then
-            rawItemNames[#rawItemNames + 1] = headerCells[i]
-            rawItemIdxs[#rawItemIdxs + 1] = i
+            rawPlayerNames[#rawPlayerNames + 1] = headerCells[i]
+            rawPlayerIdxs[#rawPlayerIdxs + 1] = i
         end
     end
-    local totalCols = #headerCells - 1
 
-    local rawPlayerNames, rawMatrix = {}, {}
+    local rawItemNames = {}
+    local rawMatrix = {}
+    for p = 1, #rawPlayerNames do rawMatrix[p] = {} end
+
     for r = 2, #lines do
         local cells = splitRow(lines[r], delim)
-        while #cells <= totalCols do cells[#cells + 1] = "" end
-        local player = cells[1] or ""
-        if player ~= "" then
-            rawPlayerNames[#rawPlayerNames + 1] = player
-            local row = {}
-            for j, origIdx in ipairs(rawItemIdxs) do
-                local val = (cells[origIdx] or ""):gsub(",", ""):gsub("^%+", "")
-                row[j] = tonumber(val)
+        local itemName = cells[1] or ""
+        if itemName ~= "" then
+            local itemIdx = #rawItemNames + 1
+            rawItemNames[itemIdx] = itemName
+            for p, origCol in ipairs(rawPlayerIdxs) do
+                local val = (cells[origCol] or ""):gsub(",", ""):gsub("^%+", "")
+                rawMatrix[p][itemIdx] = tonumber(val)
             end
-            rawMatrix[#rawMatrix + 1] = row
         end
     end
 
@@ -661,12 +663,143 @@ function cttLoot:RunCheck()
         end
 end
 
+-- ── EJ-based RC test ──────────────────────────────────────────────────────────
+-- /cttloot ejtest [N]
+--   Reads boss loot directly from the Encounter Journal for Liberation of
+--   Undermine (instance 1296), picks a random boss (or boss #N), then adds
+--   a random selection of 3-6 items to RCLootCouncil exactly as /rc add does.
+--
+--   Works entirely from live game data — no hardcoded item IDs, always current.
+--   Item links that aren't cached yet are retried once after 2 seconds.
+
+local EJ_INSTANCE_LOU    = 1296   -- Liberation of Undermine instance ID
+local ejTestBossIndex    = 1      -- cycles if no arg given
+
+function cttLoot:EJTest(bossArg)
+    if not RCLootCouncil then
+        self:Print("EJTest: RCLootCouncil not loaded.")
+        return
+    end
+    local ML = RCLootCouncil:GetActiveModule("masterlooter")
+    if not ML then
+        self:Print("EJTest: You are not the Master Looter (or ML module not active).")
+        return
+    end
+
+    -- Select the LoU instance in the EJ
+    EJ_SelectInstance(EJ_INSTANCE_LOU)
+
+    -- Build boss list from the EJ
+    local bosses = {}
+    local idx = 1
+    while true do
+        local encID, name = EJ_GetEncounterInfoByIndex(idx)
+        if not encID then break end
+        bosses[#bosses + 1] = { id = encID, name = name }
+        idx = idx + 1
+    end
+
+    if #bosses == 0 then
+        self:Print("EJTest: No bosses found for Liberation of Undermine in EJ.")
+        return
+    end
+
+    -- Pick boss
+    local bossNum
+    if bossArg and bossArg >= 1 and bossArg <= #bosses then
+        bossNum = bossArg
+    else
+        bossNum = ejTestBossIndex
+        ejTestBossIndex = (ejTestBossIndex % #bosses) + 1
+    end
+    local boss = bosses[bossNum]
+    EJ_SelectEncounter(boss.id)
+
+    -- Gather loot for this boss (loot mode 1 = normal+)
+    local lootPool = {}
+    local lootIdx = 1
+    while true do
+        local itemID = EJ_GetLootInfoByIndex(lootIdx)
+        if not itemID then break end
+        lootPool[#lootPool + 1] = itemID
+        lootIdx = lootIdx + 1
+    end
+
+    if #lootPool == 0 then
+        self:Print(string.format("EJTest: No loot found for %s in EJ.", boss.name))
+        return
+    end
+
+    -- Shuffle and pick 3-6 items
+    for i = #lootPool, 2, -1 do
+        local j = math.random(i)
+        lootPool[i], lootPool[j] = lootPool[j], lootPool[i]
+    end
+    local count = math.min(math.random(3, 6), #lootPool)
+    local picked = {}
+    for i = 1, count do picked[i] = lootPool[i] end
+
+    self:Print(string.format("[EJTest] Boss %d/%d: |cffffd700%s|r — adding %d items to RC...",
+        bossNum, #bosses, boss.name, count))
+
+    -- Add items to RC. C_Item.GetItemInfo may return nil for uncached items,
+    -- so we collect any that fail and retry once after 2 seconds.
+    local function AddToRC(itemID)
+        local _, link = C_Item.GetItemInfo(itemID)
+        if link then
+            ML:AddItem(link, true, nil, nil, nil, boss.name)
+            return true
+        end
+        return false
+    end
+
+    local retry = {}
+    for _, itemID in ipairs(picked) do
+        if not AddToRC(itemID) then
+            C_Item.RequestLoadItemDataByID(itemID)
+            retry[#retry + 1] = itemID
+        end
+    end
+
+    if #retry > 0 then
+        self:Print(string.format("EJTest: %d item(s) not cached, retrying in 2s...", #retry))
+        C_Timer.After(2, function()
+            for _, itemID in ipairs(retry) do
+                if not AddToRC(itemID) then
+                    self:Print(string.format("EJTest: item %d still not cached, skipping.", itemID))
+                end
+            end
+        end)
+    end
+end
+
 local function SlashHandler(msg)
     msg = msg:lower():match("^%s*(.-)%s*$")
     if msg == "" or msg == "show" then
         cttLoot_UI:Toggle()
+    elseif msg == "help" then
+        cttLoot:Print("Commands:")
+        cttLoot:Print("  |cffffd700/cttloot show|r — toggle window")
+        cttLoot:Print("  |cffffd700/cttloot send|r — broadcast parse data to group")
+        cttLoot:Print("  |cffffd700/cttloot check|r — verify group has same data")
+        cttLoot:Print("  |cffffd700/cttloot rcsim [boss]|r — simulate RC loot session")
+        cttLoot:Print("  |cffffd700/cttloot rctest <item>|r — test RC item match")
+        cttLoot:Print("  |cffffd700/cttloot loopback|r — toggle receiving own broadcasts")
+        cttLoot:Print("  |cffffd700/cttloot sendcheck|r — test serialize/deserialize")
+        cttLoot:Print("  |cffffd700/cttloot test|r — toggle test mode")
+        cttLoot:Print("  |cffffd700/cttloot ejtest [N]|r — RC test via Encounter Journal")
+        cttLoot:Print("  |cffffd700/cttloot lootdebug|r — print loot slot debug info")
+        cttLoot:Print("  |cffffd700/cttloot unknown|r — list unmatched CSV items")
+        cttLoot:Print("  |cffffd700/cttloot reset|r — reset window position/size")
+        cttLoot:Print("  |cffffd700/cttloot rcdebug|r — dump RC master looter methods")
     elseif msg == "check" then
         cttLoot:RunCheck()
+    elseif msg:sub(1, 6) == "rctest" then
+        cttLoot_RC:Test(msg:sub(8))
+    elseif msg:sub(1, 5) == "rcsim" then
+        cttLoot_RCSim:Run(msg:sub(7))
+    elseif msg == "rcdebug" then
+        cttLoot_RCSim:DebugRC()
     elseif msg == "reset" then
         cttLootDB.windowX = nil; cttLootDB.windowY = nil
         cttLootDB.windowW = nil; cttLootDB.windowH = nil
@@ -716,6 +849,9 @@ local function SlashHandler(msg)
         else
             cttLoot:Print("Test mode OFF.")
         end
+    elseif msg:sub(1, 6) == "ejtest" then
+        local arg = msg:sub(8):match("^%s*(.-)%s*$")
+        cttLoot:EJTest(arg ~= "" and tonumber(arg) or nil)
     elseif msg == "lootdebug" then
         local numSlots = GetNumLootItems and GetNumLootItems() or 0
         cttLoot:Print(string.format("Loot slots: %d", numSlots))
@@ -773,6 +909,7 @@ local function SlashHandler(msg)
         cttLoot:Print("/cttloot send     — broadcast data to raid/party")
         cttLoot:Print("/cttloot check    — verify everyone has the same data")
         cttLoot:Print("/cttloot test     — toggle test mode (fake loot on combat end)")
+        cttLoot:Print("/cttloot ejtest [N] — RC test: add N random LoU boss items to RC session (N=1-8)")
         cttLoot:Print("/cttloot loopback — toggle receiving your own broadcasts")
         cttLoot:Print("/cttloot unknown  — list CSV items not found in item DB")
         cttLoot:Print("/cttloot debug    — print loaded data info")
@@ -814,12 +951,18 @@ frame:SetScript("OnEvent", function(_, event, ...)
             cttLoot:Print("Loaded. Type /cttloot for commands.")
         end
     elseif event == "PLAYER_LOGIN" then
+        -- Delay RC init slightly to ensure RCLootCouncil has fully loaded
+        C_Timer.After(1, function() cttLoot_RC:Init() end)
     elseif event == "CHAT_MSG_ADDON" then
         OnAddonMessage(_, ...)
     elseif event == "ENCOUNTER_END" then
-        OnEncounterEnd(...)
+        if not (RCLootCouncil and cttLoot_RC.trackEnabled) then
+            OnEncounterEnd(...)
+        end
     elseif event == "LOOT_OPENED" then
-        OnLootOpened()
+        if not (RCLootCouncil and cttLoot_RC.trackEnabled) then
+            OnLootOpened()
+        end
     elseif event == "PLAYER_REGEN_ENABLED" then
         -- Combat ended — execute any UI actions that were deferred
         FlushPendingActions()

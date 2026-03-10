@@ -55,28 +55,36 @@ local window        = nil
 local drawer        = nil
 local drawerOpen    = false
 local cardScrollF   = nil    -- ScrollFrame for card grid
+local filterBar     = nil    -- Filter bar (for relayout after stats update)
 local cardContent   = nil    -- content frame inside scroll
 local cardPool      = {}     -- reuse frames: cardPool[i] = frame
 local activeCards   = 0
+local emptyLabel    = nil    -- reusable "no data" hint label
 
-cttLoot_UI.selectedBoss  = nil
-cttLoot_UI.selectedItem  = nil
-cttLoot_UI.lootFilter    = nil
+cttLoot_UI.selectedBoss   = nil
+cttLoot_UI.selectedItem   = nil
+cttLoot_UI.selectedPlayer = nil
+cttLoot_UI.lootFilter     = nil
 
 -- dropdown state
-local bossDdOpen  = false
-local itemDdOpen  = false
-local bossDdFrame = nil
-local itemDdFrame = nil
-local bossDdRows  = {}
-local itemDdRows  = {}
+local bossDdOpen   = false
+local itemDdOpen   = false
+local playerDdOpen = false
+local bossDdFrame  = nil
+local itemDdFrame  = nil
+local playerDdFrame = nil
+local bossDdRows   = {}
+local itemDdRows   = {}
+local playerDdRows = {}
 
 -- label fontstrings (filter bar)
-local bossDdLabel  = nil
-local itemDdLabel  = nil
-local bossClearBtn = nil
-local itemClearBtn = nil
-local statsLabel   = nil
+local bossDdLabel   = nil
+local itemDdLabel   = nil
+local playerDdLabel = nil
+local bossClearBtn  = nil
+local itemClearBtn  = nil
+local playerClearBtn = nil
+local statsLabel    = nil
 
 -- paste edit boxes
 local csvEB = nil
@@ -226,11 +234,13 @@ end
 
 
 local function CloseDropdowns()
-    bossDdOpen = false; itemDdOpen = false
-    if bossDdFrame then bossDdFrame:Hide() end
-    if itemDdFrame then itemDdFrame:Hide() end
-    if bossDdSearch then bossDdSearch:ClearFocus() end
-    if itemDdSearch then itemDdSearch:ClearFocus() end
+    bossDdOpen = false; itemDdOpen = false; playerDdOpen = false
+    if bossDdFrame   then bossDdFrame:Hide()   end
+    if itemDdFrame   then itemDdFrame:Hide()   end
+    if playerDdFrame then playerDdFrame:Hide() end
+    if bossDdSearch  then bossDdSearch:ClearFocus()  end
+    if itemDdSearch  then itemDdSearch:ClearFocus()  end
+    if playerDdSearch then playerDdSearch:ClearFocus() end
 end
 
 -- ── Drawer (settings panel, slides in from right) ─────────────────────────────
@@ -349,7 +359,7 @@ local function BuildImportSection(drawer_)
     sec.body:Show()
     sec.body:SetHeight(138)
 
-    local sf, eb = ScrollEB(sec.body, sec.body:GetWidth() - 4, 90)
+    local sf, eb = ScrollEB(sec.body, DRAWER_W - 24, 90)
     sf:SetPoint("TOPLEFT",  sec.body, "TOPLEFT",  2, -PAD)
     sf:SetPoint("TOPRIGHT", sec.body, "TOPRIGHT", -20, -PAD)
     csvEB = eb
@@ -450,7 +460,56 @@ local function BuildDBSection()
 end
 
 
--- ── Filter bar ────────────────────────────────────────────────────────────────
+-- ── Options section ───────────────────────────────────────────────────────────
+local rcHookBtn = nil
+local function BuildOptionsSection()
+    local sec = MakeDrawerSection(drawer, "Options", 0)
+    sec.body:SetHeight(80)
+
+    -- RC snap toggle button
+    rcHookBtn = Btn(sec.body, "Unsnap RC", 90, 20, "danger")
+    rcHookBtn:SetPoint("TOPLEFT", sec.body, "TOPLEFT", 2, -PAD)
+    rcHookBtn:SetScript("OnClick", function()
+        if cttLoot_RC:IsEnabled() then
+            cttLoot_RC:SetSnapEnabled(false)
+            rcHookBtn._label:SetText("Snap to RC")
+            cttLoot_UI:ReleaseSnap()
+            cttLoot:Print("RC snap disabled.")
+        else
+            cttLoot_RC:SetSnapEnabled(true)
+            rcHookBtn._label:SetText("Unsnap RC")
+            cttLoot_UI:SnapToRC()
+            cttLoot:Print("RC snap enabled.")
+        end
+    end)
+
+    local rcLabel = sec.body:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    rcLabel:SetPoint("LEFT", rcHookBtn, "RIGHT", 6, 0)
+    rcLabel:SetTextColor(0.6, 0.6, 0.6)
+    rcLabel:SetText("Snap cttLoot to RC voting frame")
+
+    -- RC integration toggle button
+    local rcIntBtn = Btn(sec.body, "Disable RC", 90, 20, "danger")
+    rcIntBtn:SetPoint("TOPLEFT", rcHookBtn, "BOTTOMLEFT", 0, -PAD)
+    rcIntBtn:SetScript("OnClick", function()
+        if cttLoot_RC.trackEnabled then
+            cttLoot_RC:SetEnabled(false)
+            rcIntBtn._label:SetText("Enable RC")
+            cttLoot:Print("RC integration disabled.")
+        else
+            cttLoot_RC:SetEnabled(true)
+            rcIntBtn._label:SetText("Disable RC")
+            cttLoot:Print("RC integration enabled.")
+        end
+    end)
+
+    local rcIntLabel = sec.body:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    rcIntLabel:SetPoint("LEFT", rcIntBtn, "RIGHT", 6, 0)
+    rcIntLabel:SetTextColor(0.6, 0.6, 0.6)
+    rcIntLabel:SetText("RCLootCouncil session tracking")
+
+    return sec
+end
 -- Returns the filter bar frame; sets module-level label/button refs.
 local function BuildFilterBar(parent, topAnchor)
     local bar = CreateFrame("Frame", nil, parent)
@@ -461,61 +520,42 @@ local function BuildFilterBar(parent, topAnchor)
     PixelBorder(bar, C.border)
     AccentLeft(bar)
 
-    local x = 10
+    local filtersVisible = true
 
-    -- "Boss" label
-    local bossLbl = bar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    bossLbl:SetPoint("LEFT", bar, "LEFT", x, 0)
-    bossLbl:SetTextColor(RGB(C.text_dim)); bossLbl:SetText("Boss")
-    x = x + bossLbl:GetStringWidth() + 6
+    -- Collapse toggle (leftmost, fixed width)
+    local toggleBtn = Btn(bar, "<<", 26, 20)
+    toggleBtn:SetPoint("LEFT", bar, "LEFT", 4, 0)
 
-    -- Boss dropdown button
+    -- Stats label (anchored RIGHT, fixed)
+    statsLabel = bar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    statsLabel:SetPoint("RIGHT", bar, "RIGHT", -10, 0)
+    statsLabel:SetTextColor(RGB(C.text_dim))
+    cttLoot_UI.statsLabel = statsLabel
+
+    -- Boss dropdown button (LEFT anchor set in relayout)
     local bossBtn = Btn(bar, "", 150, 20)
-    bossBtn:SetPoint("LEFT", bar, "LEFT", x, 0)
     bossDdLabel = bossBtn._label
     bossDdLabel:SetText("Boss")
     bossDdLabel:SetJustifyH("LEFT")
-
-    -- Arrow on right of boss button
     local bossArrow = bar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     bossArrow:SetPoint("RIGHT", bossBtn, "RIGHT", -4, 0)
     bossArrow:SetTextColor(RGB(C.text_dim)); bossArrow:SetText("▾")
 
-    -- Boss clear (✕) button
     bossClearBtn = Btn(bar, "X", 16, 16, "danger")
     bossClearBtn:SetPoint("LEFT", bossBtn, "RIGHT", 2, 0)
     bossClearBtn:Hide()
-    bossClearBtn:SetScript("OnClick", function()
-        cttLoot_UI:SetBossFilter(nil)
-    end)
+    bossClearBtn:SetScript("OnClick", function() cttLoot_UI:SetBossFilter(nil) end)
     cttLoot_UI.bossClearBtn = bossClearBtn
-
-    x = x + 150 + 18 + 4
-
-    -- Separator
-    local sep1 = FlatTex(bar, "ARTWORK", RGB(C.border))
-    sep1:SetSize(1, 16)
-    sep1:SetPoint("LEFT", bar, "LEFT", x, 0)
-    x = x + 8
-
-    -- "Item" label
-    local itemLbl = bar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    itemLbl:SetPoint("LEFT", bar, "LEFT", x, 0)
-    itemLbl:SetTextColor(RGB(C.text_dim)); itemLbl:SetText("Item")
-    x = x + itemLbl:GetStringWidth() + 6
 
     -- Item dropdown button
     local itemBtn = Btn(bar, "", 180, 20)
-    itemBtn:SetPoint("LEFT", bar, "LEFT", x, 0)
     itemDdLabel = itemBtn._label
     itemDdLabel:SetText("Item")
     itemDdLabel:SetJustifyH("LEFT")
-
     local itemArrow = bar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     itemArrow:SetPoint("RIGHT", itemBtn, "RIGHT", -4, 0)
     itemArrow:SetTextColor(RGB(C.text_dim)); itemArrow:SetText("▾")
 
-    -- Item clear button
     itemClearBtn = Btn(bar, "X", 16, 16, "danger")
     itemClearBtn:SetPoint("LEFT", itemBtn, "RIGHT", 2, 0)
     itemClearBtn:Hide()
@@ -527,48 +567,115 @@ local function BuildFilterBar(parent, topAnchor)
     end)
     cttLoot_UI.itemClearBtn = itemClearBtn
 
-    -- Stats label (right side, matching .stats-badge)
-    statsLabel = bar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    statsLabel:SetPoint("RIGHT", bar, "RIGHT", -10, 0)
-    statsLabel:SetTextColor(RGB(C.text_dim))
-    cttLoot_UI.statsLabel = statsLabel
+    -- Player dropdown button
+    local playerBtn = Btn(bar, "", 120, 20)
+    playerDdLabel = playerBtn._label
+    playerDdLabel:SetText("Player")
+    playerDdLabel:SetJustifyH("LEFT")
+    local playerArrow = bar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    playerArrow:SetPoint("RIGHT", playerBtn, "RIGHT", -4, 0)
+    playerArrow:SetTextColor(RGB(C.text_dim)); playerArrow:SetText("▾")
 
-    -- ── Boss dropdown panel ──
+    playerClearBtn = Btn(bar, "X", 16, 16, "danger")
+    playerClearBtn:SetPoint("LEFT", playerBtn, "RIGHT", 2, 0)
+    playerClearBtn:Hide()
+    playerClearBtn:SetScript("OnClick", function()
+        cttLoot_UI.selectedPlayer = nil
+        playerDdLabel:SetText("Player")
+        playerClearBtn:Hide()
+        cttLoot_UI:Refresh()
+    end)
+    cttLoot_UI.playerClearBtn = playerClearBtn
+
+    -- ── Dropdown panels ──
     bossDdFrame = CreateFrame("Frame", nil, bar)
-    bossDdFrame:SetWidth(218)
     bossDdFrame:SetPoint("TOPLEFT", bossBtn, "BOTTOMLEFT", 0, -2)
     bossDdFrame:SetFrameLevel(bar:GetFrameLevel() + 20)
     bossDdFrame:EnableMouse(true)
-    Bg(bossDdFrame, C.bg2)
-    PixelBorder(bossDdFrame, C.accent)
+    Bg(bossDdFrame, C.bg2); PixelBorder(bossDdFrame, C.accent)
     bossDdFrame:Hide()
 
-    -- ── Item dropdown panel ──
     itemDdFrame = CreateFrame("Frame", nil, bar)
-    itemDdFrame:SetWidth(238)
     itemDdFrame:SetPoint("TOPLEFT", itemBtn, "BOTTOMLEFT", 0, -2)
     itemDdFrame:SetFrameLevel(bar:GetFrameLevel() + 20)
     itemDdFrame:EnableMouse(true)
-    Bg(itemDdFrame, C.bg2)
-    PixelBorder(itemDdFrame, C.accent)
+    Bg(itemDdFrame, C.bg2); PixelBorder(itemDdFrame, C.accent)
     itemDdFrame:Hide()
 
-    -- Wire up boss button click
+    playerDdFrame = CreateFrame("Frame", nil, bar)
+    playerDdFrame:SetPoint("TOPLEFT", playerBtn, "BOTTOMLEFT", 0, -2)
+    playerDdFrame:SetFrameLevel(bar:GetFrameLevel() + 20)
+    playerDdFrame:EnableMouse(true)
+    Bg(playerDdFrame, C.bg2); PixelBorder(playerDdFrame, C.accent)
+    playerDdFrame:Hide()
+
+    -- ── Relayout: anchor chain with tight gaps, no seps ──
+    local GAP        = 3   -- gap between elements
+    local CLEAR_W    = 16  -- clear btn width
+    local TOGGLE_W   = 4 + 26 + GAP
+    local RIGHT_PAD  = 10
+
+    local function Relayout()
+        local barW = bar:GetWidth()
+        if barW < 50 then return end
+        local statsW = statsLabel:GetStringWidth() + RIGHT_PAD
+        -- fixed: toggle + 3*(clearBtn+gap) + statsW
+        local fixed  = TOGGLE_W + (CLEAR_W + GAP) * 3 + statsW
+        local avail  = math.max(barW - fixed, 120)
+        local bossW   = math.floor(avail * 0.30)
+        local itemW   = math.floor(avail * 0.40)
+        local playerW = avail - bossW - itemW
+
+        bossBtn:ClearAllPoints()
+        bossBtn:SetWidth(bossW)
+        bossBtn:SetPoint("LEFT", toggleBtn, "RIGHT", GAP, 0)
+
+        itemBtn:ClearAllPoints()
+        itemBtn:SetWidth(itemW)
+        itemBtn:SetPoint("LEFT", bossClearBtn, "RIGHT", GAP, 0)
+
+        playerBtn:ClearAllPoints()
+        playerBtn:SetWidth(playerW)
+        playerBtn:SetPoint("LEFT", itemClearBtn, "RIGHT", GAP, 0)
+
+        -- Dropdown panels auto-fit to content; set a minimum matching the button
+        if not bossDdFrame:IsShown()   then bossDdFrame:SetWidth(math.max(bossW, 160))     end
+        if not itemDdFrame:IsShown()   then itemDdFrame:SetWidth(math.max(itemW, 200))     end
+        if not playerDdFrame:IsShown() then playerDdFrame:SetWidth(math.max(playerW, 140)) end
+    end
+    bar:SetScript("OnSizeChanged", Relayout)
+    bar.Relayout = Relayout
+
+    -- ── Toggle filter visibility ──
+    local filterElements = { bossBtn, bossArrow, itemBtn, itemArrow, playerBtn, playerArrow }
+    local function SetFiltersVisible(visible)
+        filtersVisible = visible
+        for _, el in ipairs(filterElements) do
+            if visible then el:Show() else el:Hide() end
+        end
+        if not visible then
+            CloseDropdowns()
+            bossClearBtn:Hide(); itemClearBtn:Hide(); playerClearBtn:Hide()
+        end
+        toggleBtn._label:SetText(visible and "<<" or ">>")
+    end
+    toggleBtn:SetScript("OnClick", function() SetFiltersVisible(not filtersVisible) end)
+
+    -- ── Dropdown clicks ──
     bossBtn:SetScript("OnClick", function()
         if bossDdOpen then CloseDropdowns(); return end
-        CloseDropdowns()
-        bossDdOpen = true
-        cttLoot_UI:PopulateBossDropdown()
-        bossDdFrame:Show()
+        CloseDropdowns(); bossDdOpen = true
+        cttLoot_UI:PopulateBossDropdown(); bossDdFrame:Show()
     end)
-
-    -- Wire up item button click
     itemBtn:SetScript("OnClick", function()
         if itemDdOpen then CloseDropdowns(); return end
-        CloseDropdowns()
-        itemDdOpen = true
-        cttLoot_UI:PopulateItemDropdown()
-        itemDdFrame:Show()
+        CloseDropdowns(); itemDdOpen = true
+        cttLoot_UI:PopulateItemDropdown(); itemDdFrame:Show()
+    end)
+    playerBtn:SetScript("OnClick", function()
+        if playerDdOpen then CloseDropdowns(); return end
+        CloseDropdowns(); playerDdOpen = true
+        cttLoot_UI:PopulatePlayerDropdown(); playerDdFrame:Show()
     end)
 
     -- Close dropdowns when clicking elsewhere on main window
@@ -583,7 +690,7 @@ end
 local function BuildCardArea(parent, topAnchor)
     cardScrollF = CreateFrame("ScrollFrame", nil, parent, "UIPanelScrollFrameTemplate")
     cardScrollF:SetPoint("TOPLEFT",     topAnchor, "BOTTOMLEFT",  0, -PAD)
-    cardScrollF:SetPoint("BOTTOMRIGHT", parent,    "BOTTOMRIGHT", -22, PAD)
+    cardScrollF:SetPoint("BOTTOMRIGHT", parent,    "BOTTOMRIGHT", -22, PAD + 14)
 
     Bg(cardScrollF, C.bg3)
     PixelBorder(cardScrollF, C.border)
@@ -611,7 +718,6 @@ local function GetItemPool()
     local pool = {}
     local source
     if cttLoot_UI.selectedItem then
-        -- single-item detail view always takes priority
         return { cttLoot_UI.selectedItem }
     elseif cttLoot_UI.lootFilter then
         source = cttLoot_UI.lootFilter
@@ -620,8 +726,27 @@ local function GetItemPool()
     else
         source = cttLoot.itemNames
     end
+
+    local selectedPlayer = cttLoot_UI.selectedPlayer
     for _, n in ipairs(source) do
-        if not IsCatalyst(n) then table.insert(pool, n) end
+        if not IsCatalyst(n) then
+            if selectedPlayer then
+                -- Only include items where this player has a value
+                local ci = nil
+                for i, name in ipairs(cttLoot.itemNames) do
+                    if name == n then ci = i; break end
+                end
+                local playerRow = nil
+                for r, p in ipairs(cttLoot.playerNames) do
+                    if p == selectedPlayer then playerRow = cttLoot.matrix[r]; break end
+                end
+                if ci and playerRow and playerRow[ci] then
+                    table.insert(pool, n)
+                end
+            else
+                table.insert(pool, n)
+            end
+        end
     end
     return pool
 end
@@ -697,6 +822,21 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         bossFS:SetTextColor(RGB(C.accent))
         bossFS:SetText(info.boss)
         bossFS:SetJustifyH("LEFT")
+    end
+
+    -- Winner stamp — shown when RC has awarded this item
+    local winner = cttLoot_RC and cttLoot_RC.GetWinnerForItem(itemName)
+    if winner then
+        local winnerFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        winnerFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -6, -5)
+        winnerFS:SetTextColor(0.2, 1, 0.2, 1)  -- green
+        winnerFS:SetText(">> " .. winner)
+        winnerFS:SetJustifyH("RIGHT")
+
+        -- Dim the entire card to signal it's been awarded
+        local dimTex = card:CreateTexture(nil, "OVERLAY")
+        dimTex:SetAllPoints(card)
+        dimTex:SetColorTexture(0, 0, 0, 0.5)
     end
 
     hdr:SetScript("OnEnter", function() hdrBg:SetVertexColor(RGB(C.accent2)) end)
@@ -813,13 +953,13 @@ end
 
 -- Destroy all current card frames
 local function ClearCards()
+    if not cardContent then return end
     for _, c in ipairs(cardPool) do
         c:Hide()
         c:SetParent(nil)
     end
     cardPool = {}
     activeCards = 0
-    -- Also remove orphaned font strings / textures via SetHeight(1) reset
     cardContent:SetHeight(1)
 end
 
@@ -848,25 +988,32 @@ end
 
 -- Re-lay out the card grid
 local function PopulateGrid()
+    if not cardContent then return end
     ClearCards()
     BuildPlayerBestItems()
 
     local pool = GetItemPool()
 
     if #pool == 0 then
-        local empty = cardContent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-        empty:SetPoint("TOP", cardContent, "TOP", 0, -50)
-        empty:SetTextColor(RGB(C.text_dim))
-        if #cttLoot.playerNames == 0 then
-            empty:SetText("Open Settings > Import Parse Data, paste CSV, then click Load Data")
-        else
-            empty:SetText("No items match current filter")
+        if not emptyLabel then
+            emptyLabel = cardContent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            emptyLabel:SetPoint("TOP", cardContent, "TOP", 0, -50)
+            emptyLabel:SetTextColor(RGB(C.text_dim))
         end
+        if #cttLoot.playerNames == 0 then
+            emptyLabel:SetText("Open Settings > Import Parse Data, paste CSV, then click Load Data")
+        else
+            emptyLabel:SetText("No items match current filter")
+        end
+        emptyLabel:Show()
         cardContent:SetHeight(120)
 
         if statsLabel then statsLabel:SetText("") end
         return
     end
+
+    -- Cards are being shown — hide the empty label if it exists
+    if emptyLabel then emptyLabel:Hide() end
 
     -- In single-item view show all rows; otherwise cap at 10 (matching HTML limit 10)
     local rowLimit = cttLoot_UI.selectedItem and 0 or 10
@@ -903,6 +1050,7 @@ local function PopulateGrid()
             and (Clr(C.accent, "·") .. " " .. cttLoot_UI.selectedBoss .. "  ") or ""
         statsLabel:SetText(string.format("%s%d items  " .. Clr(C.accent, "·") .. "  %d players",
             bossStr, #pool, #cttLoot.playerNames))
+        if filterBar then filterBar.Relayout() end
     end
 end
 
@@ -913,7 +1061,7 @@ local DD_SEARCH_H = 22
 local DD_MAX_LIST = 220  -- max height of the scrollable list area
 
 local function BuildDdSearchAndList(ddFrame, ddW)
-    -- Search box (matching HTML .dd-search)
+    -- Search box
     local searchEB = CreateFrame("EditBox", nil, ddFrame)
     searchEB:SetHeight(DD_SEARCH_H)
     searchEB:SetPoint("TOPLEFT",  ddFrame, "TOPLEFT",  2,  -2)
@@ -927,7 +1075,6 @@ local function BuildDdSearchAndList(ddFrame, ddW)
     end)
     local searchBg = FlatTex(searchEB, "BACKGROUND", RGB(C.bg3))
     searchBg:SetAllPoints(searchEB)
-    -- bottom border line (matches .dd-search border-bottom)
     local searchDiv = FlatTex(ddFrame, "OVERLAY", RGB(C.border))
     searchDiv:SetHeight(1)
     searchDiv:SetPoint("TOPLEFT",  searchEB, "BOTTOMLEFT",  0, 0)
@@ -939,29 +1086,103 @@ local function BuildDdSearchAndList(ddFrame, ddW)
     placeholder:SetJustifyH("LEFT")
     placeholder:SetText("Search…")
     placeholder:SetPoint("LEFT", searchEB, "LEFT", 6, 0)
+    searchEB:SetScript("OnTextChanged",    function(s) placeholder:SetShown(s:GetText() == "") end)
+    searchEB:SetScript("OnEditFocusGained", function()  placeholder:Hide() end)
+    searchEB:SetScript("OnEditFocusLost",  function(s) placeholder:SetShown(s:GetText() == "") end)
 
-    searchEB:SetScript("OnTextChanged", function(s)
-        placeholder:SetShown(s:GetText() == "")
-    end)
-    searchEB:SetScript("OnEditFocusGained", function()
-        placeholder:Hide()
-    end)
-    searchEB:SetScript("OnEditFocusLost", function(s)
-        placeholder:SetShown(s:GetText() == "")
-    end)
+    -- ── Custom scroll frame (no template — scrollbar stays inside) ──
+    local SBAR_W = 8   -- thin scrollbar
 
-    -- Scroll frame for the list
-    local listSF = CreateFrame("ScrollFrame", nil, ddFrame, "UIPanelScrollFrameTemplate")
+    local listSF = CreateFrame("ScrollFrame", nil, ddFrame)
     listSF:SetPoint("TOPLEFT",  ddFrame, "TOPLEFT",  0, -(DD_SEARCH_H + 4))
-    listSF:SetPoint("TOPRIGHT", ddFrame, "TOPRIGHT", -16, -(DD_SEARCH_H + 4))
+    listSF:SetPoint("TOPRIGHT", ddFrame, "TOPRIGHT",  0, -(DD_SEARCH_H + 4))
 
     local listContent = CreateFrame("Frame", nil, listSF)
-    -- Width = ddFrame width minus scrollbar (16px) minus 2px padding each side
-    listContent:SetWidth(ddW - 16)
+    listContent:SetWidth(ddW - SBAR_W - 2)
     listContent:SetHeight(1)
     listSF:SetScrollChild(listContent)
 
-    return searchEB, listSF, listContent
+    -- Mouse wheel scrolling
+    listSF:EnableMouseWheel(true)
+    listSF:SetScript("OnMouseWheel", function(self, delta)
+        local cur  = self:GetVerticalScroll()
+        local max  = self:GetVerticalScrollRange()
+        local step = 20
+        self:SetVerticalScroll(math.max(0, math.min(max, cur - delta * step)))
+        -- update thumb
+        if max > 0 then
+            local pct = self:GetVerticalScroll() / max
+            local sfH = self:GetHeight()
+            local thumbH = math.max(16, sfH * (sfH / (sfH + max)))
+            local travel = sfH - thumbH
+            thumb:SetPoint("TOP", scrollTrack, "TOP", 0, -pct * travel)
+        end
+    end)
+
+    -- Thin scrollbar track (right edge, inside)
+    local scrollTrack = CreateFrame("Frame", nil, ddFrame)
+    scrollTrack:SetWidth(SBAR_W)
+    scrollTrack:SetPoint("TOPRIGHT",    ddFrame, "TOPRIGHT",    -1, -(DD_SEARCH_H + 5))
+    scrollTrack:SetPoint("BOTTOMRIGHT", ddFrame, "BOTTOMRIGHT", -1,  1)
+    local trackBg = FlatTex(scrollTrack, "BACKGROUND", RGB({0.12, 0.12, 0.12}))
+    trackBg:SetAllPoints(scrollTrack)
+
+    local thumb = CreateFrame("Frame", nil, scrollTrack)
+    thumb:SetWidth(SBAR_W)
+    thumb:SetHeight(20)
+    thumb:SetPoint("TOP", scrollTrack, "TOP", 0, 0)
+    local thumbTex = FlatTex(thumb, "ARTWORK", RGB({0.35, 0.35, 0.40}))
+    thumbTex:SetAllPoints(thumb)
+    thumb:Hide()
+
+    -- Update thumb on scroll
+    local function UpdateThumb()
+        local max = listSF:GetVerticalScrollRange()
+        if max <= 0 then thumb:Hide(); return end
+        thumb:Show()
+        local sfH    = listSF:GetHeight()
+        local contH  = listContent:GetHeight()
+        local thumbH = math.max(16, sfH * sfH / contH)
+        local travel = sfH - thumbH
+        local pct    = listSF:GetVerticalScroll() / max
+        thumb:SetHeight(thumbH)
+        thumb:ClearAllPoints()
+        thumb:SetPoint("TOP", scrollTrack, "TOP", 0, -pct * travel)
+    end
+    listSF:SetScript("OnVerticalScroll", function(self, offset)
+        self:SetVerticalScroll(offset)
+        UpdateThumb()
+    end)
+    listSF:SetScript("OnSizeChanged", UpdateThumb)
+    listContent:SetScript("OnSizeChanged", UpdateThumb)
+
+    -- Thumb drag
+    thumb:EnableMouse(true)
+    thumb:SetScript("OnMouseDown", function(self, btn)
+        if btn ~= "LeftButton" then return end
+        local _, thumbY  = thumb:GetCenter()
+        local _, trackY  = scrollTrack:GetTop() and 0 or 0
+        local startY     = select(2, GetCursorPosition()) / UIParent:GetEffectiveScale()
+        local startScroll = listSF:GetVerticalScroll()
+        local max        = listSF:GetVerticalScrollRange()
+        local sfH        = listSF:GetHeight()
+        local thumbH     = thumb:GetHeight()
+        local travel     = sfH - thumbH
+        thumb:SetScript("OnUpdate", function()
+            local curY = select(2, GetCursorPosition()) / UIParent:GetEffectiveScale()
+            local delta = startY - curY
+            if travel > 0 then
+                local newScroll = math.max(0, math.min(max, startScroll + delta * max / travel))
+                listSF:SetVerticalScroll(newScroll)
+                UpdateThumb()
+            end
+        end)
+    end)
+    thumb:SetScript("OnMouseUp", function(self)
+        self:SetScript("OnUpdate", nil)
+    end)
+
+    return searchEB, listSF, listContent, UpdateThumb
 end
 
 -- Populate a list content frame with rows, filtered by query string.
@@ -978,13 +1199,20 @@ local function FillDdList(listContent, listW, rows, query)
         region:Hide()
     end
 
-    local q   = query and query:lower() or ""
-    local y   = 0
-    local any = false
+    local q      = query and query:lower() or ""
+    local y      = 0
+    local any    = false
+    local maxW   = listW  -- track widest label
     for _, row in ipairs(rows) do
         local label = row.label
         if q == "" or label:lower():find(q, 1, true) then
-            local btn = Btn(listContent, label, listW, DD_ROW_H)
+            -- Measure text width + padding
+            local tmp = listContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            tmp:SetText(label)
+            local tw = tmp:GetStringWidth() + 24  -- 24px for padding + arrow
+            tmp:Hide()
+            if tw > maxW then maxW = tw end
+            local btn = Btn(listContent, label, maxW, DD_ROW_H)
             btn:SetPoint("TOPLEFT", listContent, "TOPLEFT", 0, -y)
             if row.selected then btn._bg:SetVertexColor(RGB(C.accent2)) end
             local cb = row.onSelect
@@ -992,6 +1220,10 @@ local function FillDdList(listContent, listW, rows, query)
             y   = y + DD_ROW_H + 1
             any = true
         end
+    end
+    -- Resize all buttons to the max width
+    for _, child in ipairs({ listContent:GetChildren() }) do
+        child:SetWidth(maxW)
     end
     if not any then
         local empty = listContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
@@ -1001,7 +1233,7 @@ local function FillDdList(listContent, listW, rows, query)
         y = y + 20
     end
     listContent:SetHeight(math.max(y, 1))
-    return y
+    return y, maxW
 end
 
 -- Boss search state
@@ -1022,16 +1254,20 @@ function cttLoot_UI:PopulateBossDropdown()
 
     -- Build search + list on first call
     if not bossDdSearch then
-        bossDdSearch, bossDdListSF, bossDdListC =
+        local updateThumb
+        bossDdSearch, bossDdListSF, bossDdListC, updateThumb =
             BuildDdSearchAndList(bossDdFrame, 196)
         bossDdSearch:SetScript("OnTextChanged", function(s)
             local txt = s:GetText()
             local lW = bossDdFrame:GetWidth() - 18
-            local h = FillDdList(bossDdListC, lW, bossDdAllRows, txt)
+            local h, mW = FillDdList(bossDdListC, lW, bossDdAllRows, txt)
             local listH = math.min(h, DD_MAX_LIST)
             bossDdListSF:SetHeight(listH)
+            bossDdFrame:SetWidth(mW + 4)
             bossDdFrame:SetHeight(DD_SEARCH_H + 4 + listH + 4)
+            C_Timer.After(0, updateThumb)
         end)
+        bossDdListSF.updateThumb = updateThumb
     end
 
     -- Build row descriptors
@@ -1055,10 +1291,12 @@ function cttLoot_UI:PopulateBossDropdown()
 
     bossDdSearch:SetText("")
     local listW = bossDdFrame:GetWidth() - 18
-    local h = FillDdList(bossDdListC, listW, bossDdAllRows, "")
+    local h, maxW = FillDdList(bossDdListC, listW, bossDdAllRows, "")
     local listH = math.min(h, DD_MAX_LIST)
     bossDdListSF:SetHeight(listH)
+    bossDdFrame:SetWidth(maxW + 4)
     bossDdFrame:SetHeight(DD_SEARCH_H + 4 + listH + 4)
+    C_Timer.After(0, bossDdListSF.updateThumb)
     bossDdSearch:SetFocus()
 end
 
@@ -1067,19 +1305,35 @@ function cttLoot_UI:PopulateItemDropdown()
     if not itemDdFrame then return end
 
     if not itemDdSearch then
-        itemDdSearch, itemDdListSF, itemDdListC =
+        local updateThumb
+        itemDdSearch, itemDdListSF, itemDdListC, updateThumb =
             BuildDdSearchAndList(itemDdFrame, 216)
         itemDdSearch:SetScript("OnTextChanged", function(s)
             local txt = s:GetText()
             local lW = itemDdFrame:GetWidth() - 18
-            local h = FillDdList(itemDdListC, lW, itemDdAllRows, txt)
+            local h, mW = FillDdList(itemDdListC, lW, itemDdAllRows, txt)
             local listH = math.min(h, DD_MAX_LIST)
             itemDdListSF:SetHeight(listH)
+            itemDdFrame:SetWidth(mW + 4)
             itemDdFrame:SetHeight(DD_SEARCH_H + 4 + listH + 4)
+            C_Timer.After(0, updateThumb)
         end)
+        itemDdListSF.updateThumb = updateThumb
     end
 
-    local pool = GetItemPool()
+    -- Always show the full item list in the dropdown (ignoring selectedItem filter)
+    local source
+    if self.lootFilter then
+        source = self.lootFilter
+    elseif self.selectedBoss then
+        source = self:GetVisibleItemsForBoss(self.selectedBoss)
+    else
+        source = cttLoot.itemNames
+    end
+    local pool = {}
+    for _, n in ipairs(source) do
+        if not IsCatalyst(n) then pool[#pool+1] = n end
+    end
     itemDdAllRows = {}
     if #pool == 0 then
         table.insert(itemDdAllRows, {
@@ -1105,11 +1359,76 @@ function cttLoot_UI:PopulateItemDropdown()
 
     itemDdSearch:SetText("")
     local listW = itemDdFrame:GetWidth() - 18
-    local h = FillDdList(itemDdListC, listW, itemDdAllRows, "")
+    local h, maxW = FillDdList(itemDdListC, listW, itemDdAllRows, "")
     local listH = math.min(h, DD_MAX_LIST)
     itemDdListSF:SetHeight(listH)
+    itemDdFrame:SetWidth(maxW + 4)
     itemDdFrame:SetHeight(DD_SEARCH_H + 4 + listH + 4)
+    C_Timer.After(0, itemDdListSF.updateThumb)
     itemDdSearch:SetFocus()
+end
+
+-- ── Player dropdown population ────────────────────────────────────────────────
+local playerDdSearch, playerDdListSF, playerDdListC
+local playerDdAllRows = {}
+
+function cttLoot_UI:PopulatePlayerDropdown()
+    if not playerDdFrame then return end
+
+    if not playerDdSearch then
+        local updateThumb
+        playerDdSearch, playerDdListSF, playerDdListC, updateThumb =
+            BuildDdSearchAndList(playerDdFrame, 138)
+        playerDdSearch:SetScript("OnTextChanged", function(s)
+            local txt = s:GetText()
+            local lW = playerDdFrame:GetWidth() - 18
+            local h, mW = FillDdList(playerDdListC, lW, playerDdAllRows, txt)
+            local listH = math.min(h, DD_MAX_LIST)
+            playerDdListSF:SetHeight(listH)
+            playerDdFrame:SetWidth(mW + 4)
+            playerDdFrame:SetHeight(DD_SEARCH_H + 4 + listH + 4)
+            C_Timer.After(0, updateThumb)
+        end)
+        playerDdListSF.updateThumb = updateThumb
+    end
+
+    playerDdAllRows = {}
+    -- "All Players" option
+    table.insert(playerDdAllRows, {
+        label    = "All Players",
+        selected = (self.selectedPlayer == nil),
+        onSelect = function()
+            self.selectedPlayer = nil
+            playerDdLabel:SetText("Player")
+            playerClearBtn:Hide()
+            CloseDropdowns()
+            self:Refresh()
+        end,
+    })
+    for _, playerName in ipairs(cttLoot.playerNames) do
+        local pName = playerName
+        table.insert(playerDdAllRows, {
+            label    = playerName,
+            selected = (self.selectedPlayer == playerName),
+            onSelect = function()
+                self.selectedPlayer = pName
+                playerDdLabel:SetText(pName)
+                playerClearBtn:Show()
+                CloseDropdowns()
+                self:Refresh()
+            end,
+        })
+    end
+
+    playerDdSearch:SetText("")
+    local listW = playerDdFrame:GetWidth() - 18
+    local h, maxW = FillDdList(playerDdListC, listW, playerDdAllRows, "")
+    local listH = math.min(h, DD_MAX_LIST)
+    playerDdListSF:SetHeight(listH)
+    playerDdFrame:SetWidth(maxW + 4)
+    playerDdFrame:SetHeight(DD_SEARCH_H + 4 + listH + 4)
+    C_Timer.After(0, playerDdListSF.updateThumb)
+    playerDdSearch:SetFocus()
 end
 
 -- ── Public API ────────────────────────────────────────────────────────────────
@@ -1169,12 +1488,50 @@ function cttLoot_UI:ToggleDrawer()
 end
 
 function cttLoot_UI:Toggle()
-    if not window then self:Build() end
+    if not window then
+        self:Build()
+    end
     if window:IsShown() then
         window:Hide(); CloseDropdowns()
     else
         window:Show(); self:Refresh()
     end
+end
+
+-- Open the window (build if needed). Does nothing if already visible.
+function cttLoot_UI:Open()
+    if not window then self:Build() end
+    if not window:IsShown() then
+        window:Show(); self:Refresh()
+    end
+end
+
+function cttLoot_UI:Close()
+    if window and window:IsShown() then
+        window:Hide()
+    end
+end
+
+-- Snap the cttLoot window to the right of the RC voting frame
+function cttLoot_UI:SnapToRC()
+    if not window then self:Build() end
+    if not RCLootCouncil then return end
+    local vf = RCLootCouncil:GetActiveModule("votingframe")
+    if not vf then return end
+    local rcFrame = vf.frame or vf.mainFrame or _G["RCVotingFrame"]
+    if not rcFrame or not rcFrame:IsShown() then return end
+    window:ClearAllPoints()
+    window:SetPoint("TOPLEFT", rcFrame, "TOPRIGHT", 2, -3)
+end
+
+-- Release the snap anchor and allow free movement again
+function cttLoot_UI:ReleaseSnap()
+    if not window then return end
+    local left = window:GetLeft()
+    local top  = window:GetTop()
+    window:ClearAllPoints()
+    window:SetPoint("TOPLEFT", UIParent, "TOPLEFT", left, top - UIParent:GetHeight())
+    window:SetMovable(true)
 end
 
 function cttLoot_UI:Build()
@@ -1186,12 +1543,31 @@ function cttLoot_UI:Build()
     local savedH = cttLootDB and cttLootDB.windowH or WIN_H
     window:SetSize(savedW, savedH)
 
-    -- Restore saved position or center
-    if cttLootDB and cttLootDB.windowX and cttLootDB.windowY and cttLootDB.windowPoint then
+    -- Restore saved position or center, clamping to screen bounds
+    local function RestorePosition()
+        if not (cttLootDB and cttLootDB.windowX and cttLootDB.windowY and cttLootDB.windowPoint) then
+            window:SetPoint("CENTER")
+            return
+        end
         window:SetPoint(cttLootDB.windowPoint, UIParent, cttLootDB.windowRelPoint or cttLootDB.windowPoint, cttLootDB.windowX, cttLootDB.windowY)
-    else
-        window:SetPoint("CENTER")
+        -- Clamp: if the window's top-left is off-screen, reset to center
+        local screenW = UIParent:GetWidth()
+        local screenH = UIParent:GetHeight()
+        local left  = window:GetLeft()
+        local top   = window:GetTop()
+        local right = window:GetRight()
+        local bot   = window:GetBottom()
+        if not left or not top
+            or right  < 50 or left > screenW - 50
+            or top    < 50 or bot  > screenH - 50 then
+            window:ClearAllPoints()
+            window:SetPoint("CENTER")
+            cttLootDB.windowX = nil
+            cttLootDB.windowY = nil
+            cttLootDB.windowPoint = nil
+        end
     end
+    RestorePosition()
 
     window:SetMovable(true); window:SetResizable(true)
     window:SetResizeBounds(500, 380, 1600, 1100)
@@ -1254,26 +1630,44 @@ function cttLoot_UI:Build()
 
     -- Resize grip
     local grip = CreateFrame("Button", nil, window)
-    grip:SetSize(14, 14)
+    grip:SetSize(16, 16)
     grip:SetPoint("BOTTOMRIGHT", window, "BOTTOMRIGHT", -2, 2)
     local gripTex = grip:CreateTexture(nil, "OVERLAY")
     gripTex:SetAllPoints(grip)
     gripTex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
-    grip:SetScript("OnMouseDown", function() window:StartSizing("BOTTOMRIGHT") end)
-    grip:SetScript("OnMouseUp",   function()
+    grip:SetScript("OnMouseDown", function()
+        window:SetMovable(true)
+        window:StartSizing("BOTTOMRIGHT")
+    end)
+    grip:SetScript("OnMouseUp", function()
         window:StopMovingOrSizing()
+        if cttLoot_RC:IsEnabled() then
+            cttLoot_UI:SnapToRC()
+        else
+            local point, _, relPoint, x, y = window:GetPoint(1)
+            if point then
+                cttLootDB.windowPoint    = point
+                cttLootDB.windowRelPoint = relPoint
+                cttLootDB.windowX = x
+                cttLootDB.windowY = y
+            end
+        end
+    end)
+
+    -- Reflow scroll frame and save size whenever window size changes
+    local resizeTimer = nil
+    window:SetScript("OnSizeChanged", function()
+        if not cardScrollF or not cardContent then return end
+        cardScrollF:SetPoint("BOTTOMRIGHT", window, "BOTTOMRIGHT", -22, PAD + 14)
+        cardContent:SetWidth(cardScrollF:GetWidth())
         cttLootDB.windowW = math.floor(window:GetWidth())
         cttLootDB.windowH = math.floor(window:GetHeight())
-        local point, _, relPoint, x, y = window:GetPoint(1)
-        cttLootDB.windowPoint    = point
-        cttLootDB.windowRelPoint = relPoint
-        cttLootDB.windowX = x
-        cttLootDB.windowY = y
-        if cardScrollF then
-            cardScrollF:SetPoint("BOTTOMRIGHT", window, "BOTTOMRIGHT", -22, PAD)
-            if cardContent then cardContent:SetWidth(cardScrollF:GetWidth()) end
-        end
-        cttLoot_UI:Refresh()
+        -- Debounce the expensive Refresh call
+        if resizeTimer then resizeTimer:Cancel() end
+        resizeTimer = C_Timer.NewTimer(0.15, function()
+            resizeTimer = nil
+            cttLoot_UI:Refresh()
+        end)
     end)
 
     -- ── Drawer (right-side settings panel) ──
@@ -1282,10 +1676,11 @@ function cttLoot_UI:Build()
     -- ── Drawer sections ──
     local importSec = BuildImportSection(drawer)
     BuildDBSection()
+    BuildOptionsSection()
     self:RepositionDrawer()
 
     -- ── Filter bar (anchored below title bar) ──
-    local filterBar = BuildFilterBar(window, titleBar)
+    filterBar = BuildFilterBar(window, titleBar)
 
     -- ── Card grid (fills remaining space below filter bar) ──
     BuildCardArea(window, filterBar)
@@ -1297,9 +1692,12 @@ end
 local initFrame = CreateFrame("Frame")
 initFrame:RegisterEvent("PLAYER_LOGIN")
 initFrame:SetScript("OnEvent", function()
-    cttLoot_UI:Build()
-    -- cttLoot.lua's PLAYER_LOGIN handler (registered first) has already
-    -- restored parse data into cttLoot.itemNames/playerNames/matrix.
-    -- Refresh so the card grid reflects that data immediately.
+    local ok, err = pcall(function() cttLoot_UI:Build() end)
+    if not ok then
+        cttLoot:Print("|cffff4444cttLoot UI build error: " .. tostring(err) .. "|r")
+        -- Hide the partially built window so it doesn't appear visible
+        if _G["cttLootFrame"] then _G["cttLootFrame"]:Hide() end
+        return
+    end
     cttLoot_UI:Refresh()
 end)

@@ -9,3 +9,5 @@ cttLoot.lua
 cttLoot_DB.lua
 cttLoot_UI.lua
 cttLoot_Minimap.lua
+cttLoot_RC.lua
+cttLoot_RCSim.lua
