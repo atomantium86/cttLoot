@@ -1,31 +1,35 @@
 -- cttLoot_RC.lua
--- RCLootCouncil integration:
---   • RCSessionChangedPost  → auto-filter cttLoot grid to the active session item
---   • RCMLAwardSuccess      → stamp winner name onto the awarded item's card header
--- All logic is gated behind RCLootCouncil existing — safe if RC is not installed.
+-- RCLootCouncil integration.
+--
+-- LAYER CONTRACT
+-- This module communicates with cttLoot_UI ONLY through its public methods:
+--   cttLoot_UI:SetSelectedItem(name)   cttLoot_UI:SetLootFilter(names)
+--   cttLoot_UI:SetBossFilter(name)     cttLoot_UI:Open()
+--   cttLoot_UI:Close()                 cttLoot_UI:Refresh()
+--   cttLoot_UI:SnapToRC()              cttLoot_UI:ReleaseSnap()
+--   cttLoot_UI:ResetAwardFilter()
+--
+-- Award state lives entirely inside this module.
+-- cttLoot_UI reads winner data through cttLoot:GetWinnerForItem() — NOT directly from RC.
+-- cttLoot_UI NEVER accesses cttLoot_RC fields or locals.
 
 cttLoot_RC = { trackEnabled = true }
 
 -- ── Internal state ────────────────────────────────────────────────────────────
 local activeSession   = nil
-local awardedItems    = {}
+local awardedItems    = {}   -- { [itemName:lower()] = { winner1, winner2, ... } }
 local rcSnapEnabled   = true
 local rcTrackEnabled  = true
-local rcSessionActive = false  -- true only when RC opened cttLoot via a real session
+local rcSessionActive = false
 
 -- ── Name matching ─────────────────────────────────────────────────────────────
--- Extract plain item name from an RC item link or name string.
--- RC loot table entries have a .name field (plain text) and a .link field.
 local function StripLink(link)
     if not link then return nil end
-    -- Try to extract from |Hitem:...|h[Name]|h
     local name = link:match("%[(.-)%]")
     if name then return name end
-    return link  -- already plain text
+    return link
 end
 
--- Find the best matching item name in cttLoot's item list.
--- Returns the matched cttLoot item name, or nil if no match.
 local function MatchItemName(rcName)
     if not rcName or #cttLoot.itemNames == 0 then return nil end
     local rcLower = rcName:lower()
@@ -34,30 +38,25 @@ local function MatchItemName(rcName)
     for _, name in ipairs(cttLoot.itemNames) do
         if name:lower() == rcLower then return name end
     end
-
-    -- 2. RC name contains cttLoot name (handles CATALYST suffix etc.)
+    -- 2. RC name contains cttLoot name
     for _, name in ipairs(cttLoot.itemNames) do
         if rcLower:find(name:lower(), 1, true) then return name end
     end
-
     -- 3. cttLoot name contains RC name
     for _, name in ipairs(cttLoot.itemNames) do
         if name:lower():find(rcLower, 1, true) then return name end
     end
-
     return nil
 end
 
--- ── Apply RC session filter ───────────────────────────────────────────────────
+-- ── Apply RC session filter via public UI API only ────────────────────────────
 local function ApplyRCSessionFilter(session)
     if not RCLootCouncil then return end
 
     local lootTable = RCLootCouncil:GetLootTable()
     if not lootTable or not lootTable[session] then return end
 
-    -- Build a filter list of ALL items in the current RC loot table
-    -- so that when the user clicks back from a detail view they see
-    -- only the items being voted on, not the full grid.
+    -- Build loot filter for all items in this RC loot table
     local sessionItems = {}
     local seen = {}
     for _, entry in ipairs(lootTable) do
@@ -70,23 +69,26 @@ local function ApplyRCSessionFilter(session)
             end
         end
     end
+
+    -- SetLootFilter also clears selectedItem internally — use public API
     if #sessionItems > 0 then
-        cttLoot_UI.lootFilter = sessionItems
+        cttLoot_UI:SetLootFilter(sessionItems)
     end
 
-    -- Also zoom to the specific session item
-    local entry   = lootTable[session]
-    local rcName  = entry.name or StripLink(entry.link)
-    if not rcName then return end
+    -- Zoom to the specific session item
+    local entry  = lootTable[session]
+    local rcName = entry.name or StripLink(entry.link)
+    if not rcName then
+        cttLoot_UI:Refresh()
+        return
+    end
 
     local matched = MatchItemName(rcName)
     if matched then
-        cttLoot_UI.selectedItem = matched
-        if itemDdLabel then itemDdLabel:SetText(matched) end
-        if itemClearBtn then itemClearBtn:Show() end
+        cttLoot_UI:SetSelectedItem(matched)
         cttLoot_UI:Refresh()
     else
-        cttLoot_UI.selectedItem = nil
+        cttLoot_UI:SetSelectedItem(nil)
         cttLoot_UI:Refresh()
         cttLoot:Print(string.format("|cffff4444RC session %d: no sim data for '%s'|r", session, rcName))
     end
@@ -94,49 +96,57 @@ local function ApplyRCSessionFilter(session)
     activeSession = session
 end
 
--- ── Winner annotation ─────────────────────────────────────────────────────────
--- awardedItems stores a list of winners per item (multiple drops of same item)
+-- ── Winner data ───────────────────────────────────────────────────────────────
 local function AddWinner(itemKey, name)
-    if not awardedItems[itemKey] then
-        awardedItems[itemKey] = {}
-    end
-    -- Only add if not already in list
+    if not awardedItems[itemKey] then awardedItems[itemKey] = {} end
     for _, v in ipairs(awardedItems[itemKey]) do
         if v == name then return end
     end
     table.insert(awardedItems[itemKey], name)
 end
 
+-- Read-only accessor called by cttLoot:GetWinnerForItem() facade.
+-- cttLoot_UI never calls this directly.
+function cttLoot_RC.GetWinnerForItem(itemName)
+    if not itemName then return nil end
+    local list = awardedItems[itemName:lower()]
+    if not list or #list == 0 then return nil end
+    return table.concat(list, ", ")
+end
+
+-- ── Award handling ────────────────────────────────────────────────────────────
 local function OnAwardSuccess(_, session, winner, status, link)
     if not winner or not link then return end
-
-    -- Ignore test_mode awards
     if status == "test_mode" then return end
 
     local rcName  = StripLink(link)
     local matched = MatchItemName(rcName)
     if not matched then return end
 
-    -- Strip realm from winner name
     local shortName = winner:match("^([^%-]+)") or winner
     AddWinner(matched:lower(), shortName)
+
+    -- Record to history with frozen sim snapshot
+    if cttLoot_History then cttLoot_History:RecordAward(matched, shortName) end
 
     cttLoot:Print(string.format("|cffffd700%s|r awarded to |cff00ff00%s|r", matched, shortName))
     cttLoot_UI:Refresh()
 
-    -- Broadcast award to all group members with cttLoot
     local channel = IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or nil)
     if channel then
-        local msg = "AWARD:" .. matched .. "\t" .. shortName
-        C_ChatInfo.SendAddonMessage(cttLoot.PREFIX, msg, channel)
+        C_ChatInfo.SendAddonMessage(cttLoot.PREFIX, "AWARD:" .. matched .. "\t" .. shortName, channel)
     end
 end
 
--- Handle an incoming award broadcast from the ML
 local function OnAwardReceived(itemName, winner)
     if not itemName or not winner then return end
     local matched = MatchItemName(itemName)
     if not matched then return end
+    -- Only record if not already in history (ML already recorded via OnAwardSuccess)
+    -- Non-ML members record here since they don't fire RCMLAwardSuccess
+    if cttLoot_History and not cttLoot_RC._isMasterLooter then
+        cttLoot_History:RecordAward(matched, winner)
+    end
     AddWinner(matched:lower(), winner)
     cttLoot_UI:Refresh()
 end
@@ -151,40 +161,41 @@ function cttLoot_RC.HandleMessage(message)
     return false
 end
 
--- ── Clear state when a new loot session starts ───────────────────────────────
--- Note: awardedItems is NOT cleared here — it persists until new parse data is loaded.
+-- ── Session lifecycle ─────────────────────────────────────────────────────────
 local function OnLootTableReceived()
-    activeSession = nil
+    activeSession   = nil
     rcSessionActive = false
-    cttLoot_UI.lootFilter   = nil
-    cttLoot_UI.selectedItem = nil
+    cttLoot_UI:SetLootFilter(nil)
+    cttLoot_UI:SetSelectedItem(nil)
 end
 
--- Called by cttLoot.lua when new parse data is loaded (CSV paste or broadcast receive)
+local function OnSessionEnd()
+    if not rcSessionActive then return end
+    rcSessionActive = false
+    activeSession   = nil
+    cttLoot_UI:SetLootFilter(nil)
+    cttLoot_UI:SetSelectedItem(nil)
+    cttLoot_UI:ReleaseSnap()
+    cttLoot_UI:Close()
+end
+
 function cttLoot_RC.ClearAwards()
     awardedItems = {}
-    if cttLoot_UI and cttLoot_UI.ResetAwardFilter then
-        cttLoot_UI:ResetAwardFilter()
-    end
-    if cttLoot_UI and cttLoot_UI.Refresh then
-        cttLoot_UI:Refresh()
-    end
+    if cttLoot_UI and cttLoot_UI.ResetAwardFilter then cttLoot_UI:ResetAwardFilter() end
+    if cttLoot_UI and cttLoot_UI.Refresh          then cttLoot_UI:Refresh() end
 end
 
 -- ── Initialise ────────────────────────────────────────────────────────────────
 function cttLoot_RC:Init()
-    if not RCLootCouncil then return end  -- RC not installed, do nothing
+    if not RCLootCouncil then return end
 
-    local RC = RCLootCouncil
-
+    local RC            = RCLootCouncil
     local pendingSession = nil
-    local sessionTimer = nil
+    local sessionTimer  = nil
+
     RC:RegisterMessage("RCSessionChangedPost", function(_, session)
         if not rcTrackEnabled then return end
-        if sessionTimer then
-            sessionTimer:Cancel()
-            sessionTimer = nil
-        end
+        if sessionTimer then sessionTimer:Cancel(); sessionTimer = nil end
         pendingSession = session
         sessionTimer = C_Timer.NewTimer(0.15, function()
             sessionTimer = nil
@@ -193,7 +204,7 @@ function cttLoot_RC:Init()
         end)
     end)
 
-    RC:RegisterMessage("RCMLAwardSuccess", function(_, session, winner, status, link, responseText)
+    RC:RegisterMessage("RCMLAwardSuccess", function(_, session, winner, status, link)
         if not rcTrackEnabled then return end
         OnAwardSuccess(_, session, winner, status, link)
     end)
@@ -205,12 +216,7 @@ function cttLoot_RC:Init()
 
     RC:RegisterMessage("RCLootTableHidden", function()
         if not rcTrackEnabled then return end
-        if not rcSessionActive then return end
-        rcSessionActive = false
-        cttLoot_UI.lootFilter   = nil
-        cttLoot_UI.selectedItem = nil
-        cttLoot_UI:ReleaseSnap()
-        cttLoot_UI:Close()
+        OnSessionEnd()
     end)
 
     local vf = RC:GetActiveModule("votingframe")
@@ -221,7 +227,7 @@ function cttLoot_RC:Init()
             if pendingOpen then return end
             pendingOpen = true
             C_Timer.After(0.1, function()
-                pendingOpen = false
+                pendingOpen     = false
                 rcSessionActive = true
                 ApplyRCSessionFilter(1)
                 cttLoot_UI:Open()
@@ -230,71 +236,46 @@ function cttLoot_RC:Init()
         end)
         hooksecurefunc(vf, "Show", function()
             if not rcSnapEnabled then return end
-            C_Timer.After(0.05, function()
-                cttLoot_UI:SnapToRC()
-            end)
+            C_Timer.After(0.05, function() cttLoot_UI:SnapToRC() end)
         end)
         hooksecurefunc(vf, "Hide", function()
             if not rcTrackEnabled then return end
-            if not rcSessionActive then return end
-            rcSessionActive = false
-            activeSession = nil
-            cttLoot_UI.lootFilter   = nil
-            cttLoot_UI.selectedItem = nil
-            cttLoot_UI:ReleaseSnap()
-            cttLoot_UI:Close()
+            OnSessionEnd()
         end)
     end
 end
 
--- ── Enable/disable RC snap via flag ──────────────────────────────────────────
-function cttLoot_RC:SetSnapEnabled(val)
-    rcSnapEnabled = val
-end
-
-function cttLoot_RC:IsEnabled()
-    return rcSnapEnabled
-end
+-- ── Enable / disable ──────────────────────────────────────────────────────────
+function cttLoot_RC:SetSnapEnabled(val) rcSnapEnabled = val end
+function cttLoot_RC:IsEnabled()         return rcSnapEnabled end
+function cttLoot_RC:IsSessionActive()   return rcSessionActive end
 
 function cttLoot_RC:SetEnabled(val)
-    rcTrackEnabled = val
+    rcTrackEnabled    = val
     self.trackEnabled = val
     if not val then
-        awardedItems = {}
+        awardedItems  = {}
         activeSession = nil
-        cttLoot_UI.lootFilter   = nil
-        cttLoot_UI.selectedItem = nil
+        cttLoot_UI:SetLootFilter(nil)
+        cttLoot_UI:SetSelectedItem(nil)
         cttLoot_UI:Refresh()
     end
 end
 
-function cttLoot_RC:Unhook()
-    self:SetEnabled(false)
-end
--- Usage: /cttloot rctest Augury of the Primal Flame
+function cttLoot_RC:Unhook() self:SetEnabled(false) end
+
+-- ── Debug / test ──────────────────────────────────────────────────────────────
 function cttLoot_RC:Test(itemName)
     if not itemName or itemName == "" then
-        cttLoot:Print("Usage: /cttloot rctest <item name>")
-        return
+        cttLoot:Print("Usage: /cttloot rctest <item name>"); return
     end
     local matched = MatchItemName(itemName)
     if matched then
-        cttLoot_UI.selectedItem = matched
-        cttLoot_UI.lootFilter   = nil
-        if itemDdLabel then itemDdLabel:SetText(matched) end
-        if itemClearBtn then itemClearBtn:Show() end
+        cttLoot_UI:SetLootFilter(nil)
+        cttLoot_UI:SetSelectedItem(matched)
         cttLoot_UI:Refresh()
         cttLoot:Print(string.format("RC test → |cffffd700%s|r", matched))
     else
         cttLoot:Print(string.format("RC test: no match for '%s'", itemName))
     end
-end
-
--- ── Winner stamp accessor (called from MakeCard in cttLoot_UI.lua) ────────────
--- Returns a comma-joined string of all winners, or nil if none.
-function cttLoot_RC.GetWinnerForItem(itemName)
-    if not itemName then return nil end
-    local list = awardedItems[itemName:lower()]
-    if not list or #list == 0 then return nil end
-    return table.concat(list, ", ")
 end

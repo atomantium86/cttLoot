@@ -7,7 +7,6 @@
 --   Card header click → single-item full view (all players, no row limit)
 
 cttLoot_UI = {}
-cttLoot_UI.awardedOnly  = false
 cttLoot_UI.sortByDelta  = true   -- default on
 
 -- ── Layout constants ──────────────────────────────────────────────────────────
@@ -28,6 +27,8 @@ local COL_BAR    = BAR_W + 4
 local COL_DPS    = 60
 local FBAR_H     = 26        -- filter bar height
 local DD_ROW_H   = 20        -- dropdown row height
+local DD_SEARCH_H = 22       -- dropdown search box height
+local DD_MAX_LIST = 160      -- max pixel height of dropdown list before scrolling
 
 -- ── Colour palette matching HTML :root vars ───────────────────────────────────
 local C = {
@@ -58,14 +59,30 @@ local WHITE = "Interface\\Buttons\\WHITE8X8"
 local window        = nil
 local drawer        = nil
 local drawerOpen    = false
+local syncCogColor  = nil   -- set after cogBtn is built; called by drawer X and window close
 local cardScrollF   = nil    -- ScrollFrame for card grid
 local filterBar     = nil    -- Filter bar (for relayout after stats update)
-local awardedFilterBtn = nil -- Awarded-only toggle button
 local sortFilterBtn    = nil -- Sort-by-delta toggle button
 local cardContent   = nil    -- content frame inside scroll
 local cardPool      = {}     -- reuse frames: cardPool[i] = frame
 local activeCards   = 0
 local emptyLabel    = nil    -- reusable "no data" hint label
+
+-- ── Tab state ─────────────────────────────────────────────────────────────────
+local activeTab            = "grid"   -- "grid" | "history"
+local tabGridBtn           = nil
+local tabHistoryBtn        = nil
+local historyScrollF       = nil
+local historyContent       = nil
+local historyEntryPool     = {}
+local historySelectedItem  = nil   -- nil = overview, "itemName" = detail view
+local historyDetailEntry   = nil   -- the full entry being zoomed into
+local historyFilterBar     = nil   -- the filter bar frame for history tab
+-- History filter state
+local histFilterBoss       = nil
+local histFilterPlayer     = nil
+local histFilterItem       = nil
+
 
 cttLoot_UI.selectedBoss   = nil
 cttLoot_UI.selectedItem   = nil
@@ -184,21 +201,55 @@ local function Btn(parent, label, w, h, style)
 end
 
 -- Scrollable multi-line EditBox helper
+-- Uses a plain ScrollFrame (no template) so the EditBox fills the full area.
 local function ScrollEB(parent, w, h)
-    local sf = CreateFrame("ScrollFrame", nil, parent, "UIPanelScrollFrameTemplate")
-    sf:SetSize(w, h)
+    -- Outer container — gives us a background and border over the full region
+    local container = CreateFrame("Frame", nil, parent)
+    container:SetSize(w, h)
+    local ebBg = FlatTex(container, "BACKGROUND", RGB(C.bg3))
+    ebBg:SetAllPoints(container)
+    PixelBorder(container, C.border)
+
+    -- Plain scroll frame pinned inside the container
+    local sf = CreateFrame("ScrollFrame", nil, container)
+    sf:SetPoint("TOPLEFT",     container, "TOPLEFT",     4,  -4)
+    sf:SetPoint("BOTTOMRIGHT", container, "BOTTOMRIGHT", -4,  4)
+
+    -- EditBox as the scroll child — width matches SF, height grows with content
     local eb = CreateFrame("EditBox", nil, sf)
     eb:SetMultiLine(true); eb:SetAutoFocus(false)
-    eb:SetMaxLetters(0)  -- 0 = unlimited (default is 255)
+    eb:SetMaxLetters(0)
     eb:SetFontObject("GameFontNormalSmall")
     eb:SetTextColor(RGB(C.text))
-    eb:SetWidth(w - 20)
-    local ebBg = FlatTex(eb, "BACKGROUND", RGB(C.bg3))
-    ebBg:SetAllPoints(eb)
-    PixelBorder(eb, C.border)
     eb:SetScript("OnEscapePressed", function(s) s:ClearFocus() end)
     sf:SetScrollChild(eb)
-    return sf, eb
+
+    -- Keep EB width in sync and always at least as tall as the visible SF area
+    local function SyncEB()
+        local sfW = sf:GetWidth()
+        local sfH = sf:GetHeight()
+        if sfW > 0 then eb:SetWidth(sfW) end
+        if sfH > 0 and eb:GetHeight() < sfH then eb:SetHeight(sfH) end
+    end
+    sf:SetScript("OnSizeChanged", SyncEB)
+    container:SetScript("OnSizeChanged", SyncEB)
+
+    -- Clicking anywhere in the container focuses the EditBox
+    container:EnableMouse(true)
+    container:SetScript("OnMouseDown", function(_, btn)
+        if btn == "LeftButton" then eb:SetFocus() end
+    end)
+
+    -- Mouse wheel scrolling
+    sf:EnableMouseWheel(true)
+    sf:SetScript("OnMouseWheel", function(self, delta)
+        local cur = self:GetVerticalScroll()
+        local max = self:GetVerticalScrollRange()
+        self:SetVerticalScroll(math.max(0, math.min(max, cur - delta * 20)))
+    end)
+
+    -- Return container as "sf" so callers can anchor it the same way
+    return container, eb
 end
 
 -- ── Class color cache ─────────────────────────────────────────────────────────
@@ -350,6 +401,7 @@ local function BuildDrawer(parent)
     closeX:SetPoint("RIGHT", dtb, "RIGHT", -4, 0)
     closeX:SetScript("OnClick", function()
         d:Hide(); drawerOpen = false
+        if syncCogColor then syncCogColor() end
     end)
 
     d:Hide()
@@ -363,11 +415,11 @@ local function BuildImportSection(drawer_)
     sec.open = true
     sec.arrow:SetText("-")
     sec.body:Show()
-    sec.body:SetHeight(138)
+    sec.body:SetHeight(160)
 
     local sf, eb = ScrollEB(sec.body, DRAWER_W - 24, 90)
-    sf:SetPoint("TOPLEFT",  sec.body, "TOPLEFT",  2, -PAD)
-    sf:SetPoint("TOPRIGHT", sec.body, "TOPRIGHT", -20, -PAD)
+    sf:SetPoint("TOPLEFT",  sec.body, "TOPLEFT",  PAD, -PAD)
+    sf:SetPoint("BOTTOMRIGHT", sec.body, "BOTTOMRIGHT", -PAD, PAD + 20 + PAD)
     csvEB = eb
     -- Don't try to restore raw CSV into the editbox — data is loaded directly from lastData
 
@@ -414,11 +466,11 @@ end
 -- ── Import DB section ─────────────────────────────────────────────────────────
 local function BuildDBSection()
     local sec = MakeDrawerSection(drawer, "Import Item Database", 0)
-    sec.body:SetHeight(110)
+    sec.body:SetHeight(130)
 
     local sf, eb = ScrollEB(sec.body, sec.body:GetWidth() - 4, 64)
-    sf:SetPoint("TOPLEFT",  sec.body, "TOPLEFT",  2, -PAD)
-    sf:SetPoint("TOPRIGHT", sec.body, "TOPRIGHT", -20, -PAD)
+    sf:SetPoint("TOPLEFT",  sec.body, "TOPLEFT",  PAD, -PAD)
+    sf:SetPoint("BOTTOMRIGHT", sec.body, "BOTTOMRIGHT", -PAD, PAD + 20 + PAD)
     dbEB = eb
 
     local impBtn = Btn(sec.body, "Import", 64, 20, "primary")
@@ -466,11 +518,760 @@ local function BuildDBSection()
 end
 
 
+-- ── History drawer section ───────────────────────────────────────────────────
+-- ── History filter bar ───────────────────────────────────────────────────────
+local histFilterContested = false  -- only show entries where winner wasn't #1
+
+-- Forward declarations — defined later in the file but referenced inside
+-- BuildHistoryFilterBar's OnClick closures which are compiled now.
+local BuildDdSearchAndList, FillDdList
+
+local function BuildHistoryFilterBar(parent, topAnchor)
+    local bar = CreateFrame("Frame", nil, parent)
+    bar:SetHeight(FBAR_H)
+    bar:SetPoint("TOPLEFT",  topAnchor, "BOTTOMLEFT",  0, -PAD)
+    bar:SetPoint("TOPRIGHT", topAnchor, "BOTTOMRIGHT", 0, -PAD)
+    Bg(bar, C.bg2)
+    PixelBorder(bar, C.border)
+    bar:Hide()
+
+    local hfVisible = true
+
+    -- ── Helpers ──
+    local function GetHistoryBosses()
+        local seen, out = {}, {}
+        for _, e in ipairs(cttLootDB and cttLootDB.history or {}) do
+            if e.boss and not seen[e.boss] then seen[e.boss]=true; table.insert(out, e.boss) end
+        end
+        table.sort(out); return out
+    end
+    -- Only players who have won something (and only their won items)
+    local function GetHistoryWinners()
+        local seen, out = {}, {}
+        for _, e in ipairs(cttLootDB and cttLootDB.history or {}) do
+            if e.winner and not seen[e.winner] then seen[e.winner]=true; table.insert(out, e.winner) end
+        end
+        table.sort(out); return out
+    end
+    local function GetHistoryItems()
+        local seen, out = {}, {}
+        for _, e in ipairs(cttLootDB and cttLootDB.history or {}) do
+            -- if a player filter is active, only show items that player won
+            local playerMatch = (not histFilterPlayer) or (e.winner == histFilterPlayer)
+            if playerMatch and e.itemName and not seen[e.itemName] then
+                seen[e.itemName]=true; table.insert(out, e.itemName)
+            end
+        end
+        table.sort(out); return out
+    end
+
+    -- Collapse toggle
+    local toggleBtn = Btn(bar, "<<", 26, 20)
+    toggleBtn:SetPoint("LEFT", bar, "LEFT", 4, 0)
+
+    -- Boss dropdown — parented to window (parent) so frame level is always on top
+    local bossDd = CreateFrame("Frame", nil, parent)
+    bossDd:SetFrameLevel(500)
+    Bg(bossDd, C.bg2); PixelBorder(bossDd, C.accent); bossDd:Hide(); bossDd:EnableMouse(true)
+
+    local bossBtn2 = Btn(bar, "", 130, 20)
+    local bossDdLbl = bossBtn2._label; bossDdLbl:SetText("Boss"); bossDdLbl:SetJustifyH("LEFT")
+    local bossArrow2 = bar:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+    bossArrow2:SetPoint("RIGHT", bossBtn2, "RIGHT", -4, 0)
+    bossArrow2:SetTextColor(RGB(C.text_dim)); bossArrow2:SetText("▾")
+    local bossClear2 = Btn(bar, "X", 16, 16, "danger"); bossClear2:Hide()
+    bossDd:SetPoint("TOPLEFT", bossBtn2, "BOTTOMLEFT", 0, -2)
+
+    -- Player dropdown — parented to window so frame level is always on top
+    local playerDd2 = CreateFrame("Frame", nil, parent)
+    playerDd2:SetFrameLevel(500)
+    Bg(playerDd2, C.bg2); PixelBorder(playerDd2, C.accent); playerDd2:Hide(); playerDd2:EnableMouse(true)
+
+    local playerBtn2 = Btn(bar, "", 110, 20)
+    local playerDdLbl = playerBtn2._label; playerDdLbl:SetText("Player"); playerDdLbl:SetJustifyH("LEFT")
+    local playerArrow2 = bar:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+    playerArrow2:SetPoint("RIGHT", playerBtn2, "RIGHT", -4, 0)
+    playerArrow2:SetTextColor(RGB(C.text_dim)); playerArrow2:SetText("▾")
+    local playerClear2 = Btn(bar, "X", 16, 16, "danger"); playerClear2:Hide()
+    playerDd2:SetPoint("TOPLEFT", playerBtn2, "BOTTOMLEFT", 0, -2)
+
+    -- Item dropdown — parented to window so frame level is always on top
+    local itemDd2 = CreateFrame("Frame", nil, parent)
+    itemDd2:SetFrameLevel(500)
+    Bg(itemDd2, C.bg2); PixelBorder(itemDd2, C.accent); itemDd2:Hide(); itemDd2:EnableMouse(true)
+
+    local itemBtn2 = Btn(bar, "", 160, 20)
+    local itemDdLbl = itemBtn2._label; itemDdLbl:SetText("Item"); itemDdLbl:SetJustifyH("LEFT")
+    local itemArrow2 = bar:CreateFontString(nil,"OVERLAY","GameFontNormalSmall")
+    itemArrow2:SetPoint("RIGHT", itemBtn2, "RIGHT", -4, 0)
+    itemArrow2:SetTextColor(RGB(C.text_dim)); itemArrow2:SetText("▾")
+    local itemClear2 = Btn(bar, "X", 16, 16, "danger"); itemClear2:Hide()
+    itemDd2:SetPoint("TOPLEFT", itemBtn2, "BOTTOMLEFT", 0, -2)
+
+    -- Contested toggle button — winner wasn't #1 in the sims
+    local contestedBtn = Btn(bar, "Contested", 74, 20)
+    contestedBtn._label:SetTextColor(RGB(C.text_dim))
+    -- Helper: apply the correct label color for current active state
+    local function SetContestedColor()
+        if histFilterContested then
+            contestedBtn._label:SetTextColor(RGB(C.green))
+        else
+            contestedBtn._label:SetTextColor(RGB(C.text_dim))
+        end
+    end
+    -- Override ALL four Btn scripts so active-state color is always respected
+    contestedBtn:SetScript("OnClick", function()
+        histFilterContested = not histFilterContested
+        SetContestedColor()
+        historySelectedItem = nil; historyDetailEntry = nil
+        cttLoot_UI:RefreshHistoryTab()
+    end)
+    contestedBtn:SetScript("OnEnter", function()
+        contestedBtn._bg:SetVertexColor(RGB(C.accent2))
+        SetContestedColor()   -- keep green/dim, never force white
+    end)
+    contestedBtn:SetScript("OnLeave", function()
+        contestedBtn._bg:SetVertexColor(RGB(C.bg3))
+        SetContestedColor()
+    end)
+    contestedBtn:SetScript("OnMouseDown", function()
+        contestedBtn._bg:SetVertexColor(RGB(C.accent))
+        SetContestedColor()   -- keep green/dim on press too
+    end)
+    contestedBtn:SetScript("OnMouseUp", function()
+        contestedBtn._bg:SetVertexColor(RGB(C.bg3))
+        SetContestedColor()
+    end)
+
+    -- ── Per-dropdown search/list state (lazy-built on first open) ──
+    local hBossDdSearch, hBossDdListSF, hBossDdListC, hBossDdThumb
+    local hPlyrDdSearch, hPlyrDdListSF, hPlyrDdListC, hPlyrDdThumb
+    local hItemDdSearch, hItemDdListSF, hItemDdListC, hItemDdThumb
+    local hBossDdRows, hPlyrDdRows, hItemDdRows = {}, {}, {}
+
+    -- ── Dropdown close helper ──
+    local function CloseHDd()
+        bossDd:Hide(); playerDd2:Hide(); itemDd2:Hide()
+    end
+
+    -- ── Shared open helper — mirrors PopulateBossDropdown pattern ──
+    -- lW seed: use current width if already sized, else 120 minimum so FillDdList
+    -- gets a valid positive number before we resize ddFrame to fit content.
+    local function OpenHDd(ddFrame, searchEB, listSF, listC, rows, updateThumb)
+        searchEB:SetText("")
+        local seedW = math.max(ddFrame:GetWidth(), 120)
+        local lW = seedW - 18
+        local h, maxW = FillDdList(listC, lW, rows, "")
+        local listH = math.min(h, DD_MAX_LIST)
+        listSF:SetHeight(listH)
+        ddFrame:SetWidth(maxW + 4)
+        ddFrame:SetHeight(DD_SEARCH_H + 4 + listH + 4)
+        C_Timer.After(0, updateThumb)
+        searchEB:SetFocus()
+        ddFrame:Show()
+    end
+
+    -- ── Layout: Boss → Item → Player (left), Contested pinned right ──
+    local GAP        = 3
+    local CLEAR_W    = 16
+    local TOGGLE_W   = 4 + 26 + GAP
+    local CONT_RIGHT = 74 + 8
+    -- All anchors set once here — HRelayout only calls SetWidth.
+    bossBtn2:SetPoint("LEFT", toggleBtn, "RIGHT", GAP, 0)
+    bossClear2:SetPoint("LEFT", bossBtn2, "RIGHT", GAP, 0)
+    itemBtn2:SetPoint("LEFT", bossClear2, "RIGHT", GAP, 0)
+    itemClear2:SetPoint("LEFT", itemBtn2, "RIGHT", GAP, 0)
+    playerBtn2:SetPoint("LEFT", itemClear2, "RIGHT", GAP, 0)
+    playerClear2:SetPoint("LEFT", playerBtn2, "RIGHT", GAP, 0)
+    contestedBtn:SetPoint("RIGHT", bar, "RIGHT", -8, 0)
+
+    local _lastBossW2, _lastItemW2, _lastPlayerW2 = 0, 0, 0
+    local function HRelayout()
+        local barW = bar:GetWidth(); if barW < 50 then return end
+        local fixed = TOGGLE_W + (CLEAR_W + GAP) * 3 + CONT_RIGHT + GAP
+        local avail = math.max(barW - fixed, 120)
+        local bossW   = math.floor(avail * 0.30)
+        local itemW   = math.floor(avail * 0.40)
+        local playerW = avail - bossW - itemW
+        if bossW   ~= _lastBossW2   then bossBtn2:SetWidth(bossW);     _lastBossW2   = bossW   end
+        if itemW   ~= _lastItemW2   then itemBtn2:SetWidth(itemW);     _lastItemW2   = itemW   end
+        if playerW ~= _lastPlayerW2 then playerBtn2:SetWidth(playerW); _lastPlayerW2 = playerW end
+    end
+    bar:SetScript("OnSizeChanged", HRelayout)
+    bar.Relayout = HRelayout
+
+    -- ── Boss wiring ──
+    bossBtn2:SetScript("OnClick", function()
+        if bossDd:IsShown() then CloseHDd(); return end
+        CloseHDd()
+        if not hBossDdSearch then
+            hBossDdSearch, hBossDdListSF, hBossDdListC, hBossDdThumb =
+                BuildDdSearchAndList(bossDd, 180)
+            hBossDdSearch:SetScript("OnTextChanged", function(s)
+                local h2, mW = FillDdList(hBossDdListC, bossDd:GetWidth()-18, hBossDdRows, s:GetText())
+                local lH = math.min(h2, DD_MAX_LIST)
+                hBossDdListSF:SetHeight(lH)
+                bossDd:SetWidth(mW+4); bossDd:SetHeight(DD_SEARCH_H+4+lH+4)
+                C_Timer.After(0, hBossDdThumb)
+            end)
+        end
+        hBossDdRows = {}
+        table.insert(hBossDdRows, {
+            label = "All Bosses", selected = (histFilterBoss == nil),
+            onSelect = function()
+                histFilterBoss = nil; bossDdLbl:SetText("Boss"); bossClear2:Hide()
+                historySelectedItem = nil; historyDetailEntry = nil
+                CloseHDd(); cttLoot_UI:RefreshHistoryTab()
+            end,
+        })
+        for _, v in ipairs(GetHistoryBosses()) do
+            local cap = v
+            table.insert(hBossDdRows, {
+                label = v, selected = (histFilterBoss == v),
+                onSelect = function()
+                    histFilterBoss = cap; bossDdLbl:SetText(cap)
+                    if hfVisible then bossClear2:Show() end
+                    historySelectedItem = nil; historyDetailEntry = nil
+                    CloseHDd(); cttLoot_UI:RefreshHistoryTab()
+                end,
+            })
+        end
+        OpenHDd(bossDd, hBossDdSearch, hBossDdListSF, hBossDdListC, hBossDdRows, hBossDdThumb)
+    end)
+    bossClear2:SetScript("OnClick", function()
+        histFilterBoss = nil; bossDdLbl:SetText("Boss"); bossClear2:Hide()
+        historySelectedItem = nil; historyDetailEntry = nil
+        cttLoot_UI:RefreshHistoryTab()
+    end)
+
+    -- ── Player wiring ──
+    playerBtn2:SetScript("OnClick", function()
+        if playerDd2:IsShown() then CloseHDd(); return end
+        CloseHDd()
+        if not hPlyrDdSearch then
+            hPlyrDdSearch, hPlyrDdListSF, hPlyrDdListC, hPlyrDdThumb =
+                BuildDdSearchAndList(playerDd2, 160)
+            hPlyrDdSearch:SetScript("OnTextChanged", function(s)
+                local h2, mW = FillDdList(hPlyrDdListC, playerDd2:GetWidth()-18, hPlyrDdRows, s:GetText())
+                local lH = math.min(h2, DD_MAX_LIST)
+                hPlyrDdListSF:SetHeight(lH)
+                playerDd2:SetWidth(mW+4); playerDd2:SetHeight(DD_SEARCH_H+4+lH+4)
+                C_Timer.After(0, hPlyrDdThumb)
+            end)
+        end
+        hPlyrDdRows = {}
+        table.insert(hPlyrDdRows, {
+            label = "All Players", selected = (histFilterPlayer == nil),
+            onSelect = function()
+                histFilterPlayer = nil; playerDdLbl:SetText("Player"); playerClear2:Hide()
+                historySelectedItem = nil; historyDetailEntry = nil
+                CloseHDd(); cttLoot_UI:RefreshHistoryTab()
+            end,
+        })
+        for _, v in ipairs(GetHistoryWinners()) do
+            local cap = v
+            table.insert(hPlyrDdRows, {
+                label = v, selected = (histFilterPlayer == v),
+                onSelect = function()
+                    histFilterPlayer = cap; playerDdLbl:SetText(cap)
+                    histFilterItem = nil; itemDdLbl:SetText("Item"); itemClear2:Hide()
+                    if hfVisible then playerClear2:Show() end
+                    historySelectedItem = nil; historyDetailEntry = nil
+                    CloseHDd(); cttLoot_UI:RefreshHistoryTab()
+                end,
+            })
+        end
+        OpenHDd(playerDd2, hPlyrDdSearch, hPlyrDdListSF, hPlyrDdListC, hPlyrDdRows, hPlyrDdThumb)
+    end)
+    playerClear2:SetScript("OnClick", function()
+        histFilterPlayer = nil; playerDdLbl:SetText("Player"); playerClear2:Hide()
+        historySelectedItem = nil; historyDetailEntry = nil
+        cttLoot_UI:RefreshHistoryTab()
+    end)
+
+    -- ── Item wiring ──
+    itemBtn2:SetScript("OnClick", function()
+        if itemDd2:IsShown() then CloseHDd(); return end
+        CloseHDd()
+        if not hItemDdSearch then
+            hItemDdSearch, hItemDdListSF, hItemDdListC, hItemDdThumb =
+                BuildDdSearchAndList(itemDd2, 210)
+            hItemDdSearch:SetScript("OnTextChanged", function(s)
+                local h2, mW = FillDdList(hItemDdListC, itemDd2:GetWidth()-18, hItemDdRows, s:GetText())
+                local lH = math.min(h2, DD_MAX_LIST)
+                hItemDdListSF:SetHeight(lH)
+                itemDd2:SetWidth(mW+4); itemDd2:SetHeight(DD_SEARCH_H+4+lH+4)
+                C_Timer.After(0, hItemDdThumb)
+            end)
+        end
+        hItemDdRows = {}
+        table.insert(hItemDdRows, {
+            label = "All Items", selected = (histFilterItem == nil),
+            onSelect = function()
+                histFilterItem = nil; itemDdLbl:SetText("Item"); itemClear2:Hide()
+                historySelectedItem = nil; historyDetailEntry = nil
+                CloseHDd(); cttLoot_UI:RefreshHistoryTab()
+            end,
+        })
+        for _, v in ipairs(GetHistoryItems()) do
+            local cap = v
+            table.insert(hItemDdRows, {
+                label = v, selected = (histFilterItem == v),
+                onSelect = function()
+                    histFilterItem = cap; itemDdLbl:SetText(cap)
+                    if hfVisible then itemClear2:Show() end
+                    historySelectedItem = nil; historyDetailEntry = nil
+                    CloseHDd(); cttLoot_UI:RefreshHistoryTab()
+                end,
+            })
+        end
+        OpenHDd(itemDd2, hItemDdSearch, hItemDdListSF, hItemDdListC, hItemDdRows, hItemDdThumb)
+    end)
+    itemClear2:SetScript("OnClick", function()
+        histFilterItem = nil; itemDdLbl:SetText("Item"); itemClear2:Hide()
+        historySelectedItem = nil; historyDetailEntry = nil
+        cttLoot_UI:RefreshHistoryTab()
+    end)
+
+    -- ── Collapse toggle ──
+    local hfElements = { bossBtn2, bossArrow2, playerBtn2, playerArrow2,
+                         itemBtn2, itemArrow2, contestedBtn }
+    local function SetHFVisible(vis)
+        hfVisible = vis
+        for _, el in ipairs(hfElements) do if vis then el:Show() else el:Hide() end end
+        if not vis then
+            CloseHDd()
+            bossClear2:Hide(); playerClear2:Hide(); itemClear2:Hide()
+        else
+            if histFilterBoss   then bossClear2:Show()   end
+            if histFilterPlayer then playerClear2:Show() end
+            if histFilterItem   then itemClear2:Show()   end
+        end
+        toggleBtn._label:SetText(vis and "<<" or ">>")
+    end
+    toggleBtn:SetScript("OnClick", function() SetHFVisible(not hfVisible) end)
+
+    C_Timer.After(0, HRelayout)
+    historyFilterBar = bar
+    return bar
+end
+
+-- ── History tab content area ──────────────────────────────────────────────────
+local function BuildHistoryArea(parent, topAnchor, bottomAnchor)
+    historyScrollF = CreateFrame("ScrollFrame", nil, parent, "UIPanelScrollFrameTemplate")
+    -- Anchor below the history filter bar (which is itself below topAnchor)
+    historyScrollF:SetPoint("TOPLEFT",  historyFilterBar, "BOTTOMLEFT",  0, -PAD)
+    if bottomAnchor then
+        historyScrollF:SetPoint("BOTTOMRIGHT", bottomAnchor, "TOPRIGHT", -22, PAD)
+    else
+        historyScrollF:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -22, PAD + 14)
+    end
+    Bg(historyScrollF, C.bg3)
+    PixelBorder(historyScrollF, C.border)
+
+    historyContent = CreateFrame("Frame", nil, historyScrollF)
+    historyContent:SetWidth(historyScrollF:GetWidth())
+    historyContent:SetHeight(1)
+    historyScrollF:SetScrollChild(historyContent)
+    historyScrollF:Hide()
+end
+
+local function ClearHistoryArea()
+    if not historyContent then return end
+    for _, f in ipairs(historyEntryPool) do
+        f:Hide()
+    end
+    historyEntryPool = {}
+    historyContent:SetHeight(1)
+end
+
+-- Format a unix timestamp as "YYYY-MM-DD HH:MM"
+local function FormatTime(ts)
+    local d = date("*t", ts)
+    return string.format("%02d-%02d-%04d  %02d:%02d", d.month, d.day, d.year, d.hour, d.min)
+end
+
+function cttLoot_UI:RefreshHistoryTab()
+    if not historyContent then return end
+    ClearHistoryArea()
+
+    local rawEntries = cttLoot_History and cttLoot_History:GetAll() or {}
+    -- Apply filters
+    local allEntries = {}
+    for _, e in ipairs(rawEntries) do
+        local pass = true
+        if histFilterBoss   and e.boss     ~= histFilterBoss   then pass = false end
+        if histFilterPlayer and e.winner   ~= histFilterPlayer  then pass = false end
+        if histFilterItem   and e.itemName ~= histFilterItem   then pass = false end
+        -- Contested: winner was not ranked #1 in the frozen sim snapshot.
+        -- We use vals.base (not catalyst) for ranking, matching the main grid sort.
+        -- If no sim data exists for this entry we cannot determine rank, so exclude it.
+        if pass and histFilterContested then
+            local topDps, topPlayer = -math.huge, nil
+            for playerName, vals in pairs(e.sims or {}) do
+                local base = vals.base
+                if base and base > topDps then topDps = base; topPlayer = playerName end
+            end
+            if not topPlayer then
+                -- no sim data — can't confirm contested, exclude
+                pass = false
+            elseif e.winner == topPlayer then
+                -- winner WAS the top sim — not contested
+                pass = false
+            end
+            -- else: winner exists but was not #1 — contested, keep
+        end
+        if pass then table.insert(allEntries, e) end
+    end
+    local gridW = historyScrollF:GetWidth() - 4
+
+    if #allEntries == 0 then
+        local lbl = historyContent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        lbl:SetPoint("TOP", historyContent, "TOP", 0, -50)
+        lbl:SetTextColor(RGB(C.text_dim))
+        lbl:SetText("No loot decisions recorded yet.")
+        table.insert(historyEntryPool, lbl)
+        historyContent:SetHeight(120)
+        return
+    end
+
+    -- ── Detail view ──────────────────────────────────────────────────────────
+    if historySelectedItem and historyDetailEntry then
+        local entry  = historyDetailEntry
+        local cardW  = gridW - PAD * 2
+
+        -- Build sorted sim rows from the frozen snapshot (show all, including negatives)
+        local simRows = {}
+        for playerName, vals in pairs(entry.sims or {}) do
+            if vals.base then table.insert(simRows, { player=playerName, dps=vals.base, isCat=false }) end
+            if vals.cat  then table.insert(simRows, { player=playerName, dps=vals.cat,  isCat=true  }) end
+        end
+        table.sort(simRows, function(a,b) return a.dps > b.dps end)
+
+        local maxAbs = 1
+        for _, r in ipairs(simRows) do if math.abs(r.dps) > maxAbs then maxAbs = math.abs(r.dps) end end
+
+        -- Header heights (mirrors MakeCard logic)
+        local hasBoss = entry.boss and entry.boss ~= ""
+        local hdrH = 20
+        if hasBoss then hdrH = 32 end
+        if hasBoss and entry.winner then hdrH = 44 end
+        local cardH = hdrH + #simRows * ROW_H + 2
+
+        local card = CreateFrame("Frame", nil, historyContent)
+        card:SetSize(cardW, cardH)
+        card:SetPoint("TOPLEFT", historyContent, "TOPLEFT", PAD, -PAD)
+        Bg(card, C.card_bg)
+        PixelBorder(card, C.border)
+        table.insert(historyEntryPool, card)
+
+        -- Header button — clicking back returns to overview
+        local hdr = CreateFrame("Button", nil, card)
+        hdr:SetHeight(hdrH)
+        hdr:SetPoint("TOPLEFT"); hdr:SetPoint("TOPRIGHT")
+        local hdrBg = Bg(hdr, C.card_hdr)
+
+        local titleFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        titleFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -4)
+        titleFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -4)
+        titleFS:SetHeight(12)
+        titleFS:SetTextColor(RGB(C.text_hi))
+        titleFS:SetText(entry.itemName or "Unknown")
+        titleFS:SetJustifyH("LEFT"); titleFS:SetWordWrap(false); titleFS:SetNonSpaceWrap(false)
+
+        if hasBoss then
+            local bossFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            bossFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -17)
+            bossFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -17)
+            bossFS:SetHeight(12)
+            bossFS:SetTextColor(RGB(C.accent))
+            bossFS:SetText(entry.boss)
+            bossFS:SetJustifyH("LEFT"); bossFS:SetWordWrap(false); bossFS:SetNonSpaceWrap(false)
+        end
+
+        if entry.winner then
+            local winnerFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            if hasBoss then
+                winnerFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -29)
+                winnerFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -29)
+                winnerFS:SetJustifyH("LEFT")
+            else
+                winnerFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -4)
+                winnerFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -4)
+                winnerFS:SetJustifyH("RIGHT")
+            end
+            winnerFS:SetHeight(12); winnerFS:SetWordWrap(false); winnerFS:SetNonSpaceWrap(false)
+            winnerFS:SetTextColor(0.2, 1, 0.2, 1)
+            -- Date on the right side of the winner line
+            local dateStr = FormatTime(entry.timestamp)
+            winnerFS:SetText(">> " .. entry.winner .. "  |cff6e6e6e" .. dateStr .. "|r")
+        end
+
+        hdr:SetScript("OnEnter", function() hdrBg:SetVertexColor(RGB(C.accent2)) end)
+        hdr:SetScript("OnLeave", function() hdrBg:SetVertexColor(RGB(C.card_hdr)) end)
+        hdr:SetScript("OnClick", function()
+            historySelectedItem = nil
+            historyDetailEntry  = nil
+            cttLoot_UI:RefreshHistoryTab()
+        end)
+
+        -- Rows
+        for i, row in ipairs(simRows) do
+            local ry = hdrH + (i-1) * ROW_H
+            local isWinner = (not row.isCat) and (row.player == entry.winner)
+
+            if isWinner then
+                local ar, ag, ab = RGB(C.accent)
+                local bestBg = FlatTex(card, "BACKGROUND", ar, ag, ab, 0.15)
+                bestBg:SetSize(cardW, ROW_H)
+                bestBg:SetPoint("TOPLEFT", card, "TOPLEFT", 0, -ry)
+            elseif i % 2 == 0 then
+                local rowBg = FlatTex(card, "BACKGROUND", 1, 1, 1, 0.03)
+                rowBg:SetSize(cardW, ROW_H)
+                rowBg:SetPoint("TOPLEFT", card, "TOPLEFT", 0, -ry)
+            end
+
+            local rankFS = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            rankFS:SetSize(COL_RANK, ROW_H)
+            rankFS:SetPoint("TOPLEFT", card, "TOPLEFT", 2, -ry)
+            rankFS:SetJustifyH("CENTER"); rankFS:SetJustifyV("MIDDLE")
+            if     i == 1 then rankFS:SetTextColor(RGB(C.rank_gold))
+            elseif i == 2 then rankFS:SetTextColor(RGB(C.rank_silver))
+            elseif i == 3 then rankFS:SetTextColor(RGB(C.rank_bronze))
+            else               rankFS:SetTextColor(RGB(C.text_dim)) end
+            rankFS:SetText(tostring(i))
+
+            local nameFS = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            nameFS:SetSize(COL_NAME, ROW_H)
+            nameFS:SetPoint("TOPLEFT", card, "TOPLEFT", COL_RANK + 2, -ry)
+            nameFS:SetJustifyH("LEFT"); nameFS:SetJustifyV("MIDDLE")
+            local cc = GetClassColor(row.player)
+            if row.isCat then
+                nameFS:SetText(row.player .. " " .. Clr(C.catalyst, "(cat)"))
+                if cc then nameFS:SetTextColor(cc[1],cc[2],cc[3]) else nameFS:SetTextColor(RGB(C.text)) end
+            else
+                nameFS:SetText(row.player)
+                if cc then nameFS:SetTextColor(cc[1],cc[2],cc[3]) else nameFS:SetTextColor(RGB(C.text)) end
+            end
+
+            local dynBarW = cardW - COL_RANK - COL_NAME - COL_DPS - 10
+            local barBg = FlatTex(card, "BACKGROUND", 1, 1, 1, 0.06)
+            barBg:SetSize(dynBarW, BAR_H)
+            barBg:SetPoint("TOPLEFT", card, "TOPLEFT", COL_RANK + COL_NAME + 2, -ry - (ROW_H - BAR_H) / 2)
+
+            local barPct  = math.max(0.01, math.abs(row.dps) / maxAbs)
+            local fillW   = math.max(2, math.floor(barPct * dynBarW))
+            local barFill = FlatTex(card, "ARTWORK", 1, 1, 1, 0.85)
+            barFill:SetSize(fillW, BAR_H)
+            barFill:SetPoint("TOPLEFT", barBg, "TOPLEFT", 0, 0)
+            if row.isCat then barFill:SetVertexColor(RGB(C.catalyst))
+            elseif row.dps >= 0 then barFill:SetVertexColor(RGB(C.green))
+            else barFill:SetVertexColor(RGB(C.red)) end
+
+            local dpsFS = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            dpsFS:SetSize(COL_DPS, ROW_H)
+            dpsFS:SetPoint("TOPRIGHT", card, "TOPRIGHT", -4, -ry)
+            dpsFS:SetJustifyH("RIGHT"); dpsFS:SetJustifyV("MIDDLE")
+            local sign = row.dps >= 0 and "+" or ""
+            dpsFS:SetText(string.format("%s%.0f", sign, row.dps))
+            if row.isCat then dpsFS:SetTextColor(RGB(C.catalyst))
+            elseif row.dps >= 0 then dpsFS:SetTextColor(RGB(C.green))
+            else dpsFS:SetTextColor(RGB(C.red)) end
+
+            if i < #simRows then
+                local sep = FlatTex(card, "BACKGROUND", RGB(C.border))
+                sep:SetHeight(1)
+                sep:SetPoint("BOTTOMLEFT",  card, "TOPLEFT",  0, -(ry + ROW_H - 1))
+                sep:SetPoint("BOTTOMRIGHT", card, "TOPRIGHT", 0, -(ry + ROW_H - 1))
+            end
+        end
+
+        historyContent:SetWidth(gridW)
+        historyContent:SetHeight(math.max(cardH + PAD * 2, 80))
+        return
+    end
+
+    -- ── Overview grid ─────────────────────────────────────────────────────────
+    -- Build one compact card per history entry (same multi-column layout as main grid)
+    local cols    = math.max(1, math.floor((gridW + CARD_GAP) / (CARD_W + CARD_GAP)))
+    local col     = 0
+    local totalH  = PAD
+    local rowMaxH = 0
+
+    for _, entry in ipairs(allEntries) do
+        -- Build sorted sim rows, capped at 10 rows like the main overview
+        local simRows = {}
+        for playerName, vals in pairs(entry.sims or {}) do
+            if vals.base and vals.base >= 0 then
+                table.insert(simRows, { player=playerName, dps=vals.base, isCat=false })
+            end
+            if vals.cat and vals.cat >= 0 then
+                table.insert(simRows, { player=playerName, dps=vals.cat,  isCat=true })
+            end
+        end
+        table.sort(simRows, function(a,b) return a.dps > b.dps end)
+        -- Cap at 10
+        while #simRows > 10 do table.remove(simRows) end
+
+        local maxAbs = 1
+        for _, r in ipairs(simRows) do if math.abs(r.dps) > maxAbs then maxAbs = math.abs(r.dps) end end
+
+        local hasBoss = entry.boss and entry.boss ~= ""
+        local hdrH = 20
+        if hasBoss then hdrH = 32 end
+        if hasBoss and entry.winner then hdrH = 44 end
+        local cardH = hdrH + #simRows * ROW_H + 2
+
+        local ox   = PAD + col * (CARD_W + CARD_GAP)
+        local card = CreateFrame("Frame", nil, historyContent)
+        card:SetSize(CARD_W, cardH)
+        card:SetPoint("TOPLEFT", historyContent, "TOPLEFT", ox, -totalH)
+        Bg(card, C.card_bg)
+        PixelBorder(card, C.border)
+        table.insert(historyEntryPool, card)
+
+        -- Header button
+        local hdr = CreateFrame("Button", nil, card)
+        hdr:SetHeight(hdrH)
+        hdr:SetPoint("TOPLEFT"); hdr:SetPoint("TOPRIGHT")
+        local hdrBg = Bg(hdr, C.card_hdr)
+
+        local titleFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        titleFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -4)
+        titleFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -4)
+        titleFS:SetHeight(12)
+        titleFS:SetTextColor(RGB(C.text_hi))
+        titleFS:SetText(entry.itemName or "Unknown")
+        titleFS:SetJustifyH("LEFT"); titleFS:SetWordWrap(false); titleFS:SetNonSpaceWrap(false)
+
+        if hasBoss then
+            local bossFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            bossFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -17)
+            bossFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -17)
+            bossFS:SetHeight(12)
+            bossFS:SetTextColor(RGB(C.accent))
+            bossFS:SetText(entry.boss)
+            bossFS:SetJustifyH("LEFT"); bossFS:SetWordWrap(false); bossFS:SetNonSpaceWrap(false)
+        end
+
+        if entry.winner then
+            local winnerFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            if hasBoss then
+                winnerFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -29)
+                winnerFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -29)
+                winnerFS:SetJustifyH("LEFT")
+            else
+                winnerFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -4)
+                winnerFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -4)
+                winnerFS:SetJustifyH("RIGHT")
+            end
+            winnerFS:SetHeight(12); winnerFS:SetWordWrap(false); winnerFS:SetNonSpaceWrap(false)
+            winnerFS:SetTextColor(0.2, 1, 0.2, 1)
+            local dateStr = FormatTime(entry.timestamp)
+            winnerFS:SetText(">> " .. entry.winner .. "  |cff6e6e6e" .. dateStr .. "|r")
+        end
+
+        hdr:SetScript("OnEnter", function() hdrBg:SetVertexColor(RGB(C.accent2)) end)
+        hdr:SetScript("OnLeave", function() hdrBg:SetVertexColor(RGB(C.card_hdr)) end)
+
+        -- Capture entry for click closure
+        local capturedEntry = entry
+        hdr:SetScript("OnClick", function()
+            historySelectedItem = capturedEntry.itemName
+            historyDetailEntry  = capturedEntry
+            cttLoot_UI:RefreshHistoryTab()
+        end)
+
+        -- Rows
+        for i, row in ipairs(simRows) do
+            local ry       = hdrH + (i-1) * ROW_H
+            local isWinner = (not row.isCat) and (row.player == entry.winner)
+
+            if isWinner then
+                local ar, ag, ab = RGB(C.accent)
+                local bestBg = FlatTex(card, "BACKGROUND", ar, ag, ab, 0.15)
+                bestBg:SetSize(CARD_W, ROW_H)
+                bestBg:SetPoint("TOPLEFT", card, "TOPLEFT", 0, -ry)
+            elseif i % 2 == 0 then
+                local rowBg = FlatTex(card, "BACKGROUND", 1, 1, 1, 0.03)
+                rowBg:SetSize(CARD_W, ROW_H)
+                rowBg:SetPoint("TOPLEFT", card, "TOPLEFT", 0, -ry)
+            end
+
+            local rankFS = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            rankFS:SetSize(COL_RANK, ROW_H)
+            rankFS:SetPoint("TOPLEFT", card, "TOPLEFT", 2, -ry)
+            rankFS:SetJustifyH("CENTER"); rankFS:SetJustifyV("MIDDLE")
+            if     i == 1 then rankFS:SetTextColor(RGB(C.rank_gold))
+            elseif i == 2 then rankFS:SetTextColor(RGB(C.rank_silver))
+            elseif i == 3 then rankFS:SetTextColor(RGB(C.rank_bronze))
+            else               rankFS:SetTextColor(RGB(C.text_dim)) end
+            rankFS:SetText(tostring(i))
+
+            local nameFS = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            nameFS:SetSize(COL_NAME, ROW_H)
+            nameFS:SetPoint("TOPLEFT", card, "TOPLEFT", COL_RANK + 2, -ry)
+            nameFS:SetJustifyH("LEFT"); nameFS:SetJustifyV("MIDDLE")
+            local cc = GetClassColor(row.player)
+            if row.isCat then
+                nameFS:SetText(row.player .. " " .. Clr(C.catalyst, "(cat)"))
+            else
+                nameFS:SetText(row.player)
+            end
+            if cc then nameFS:SetTextColor(cc[1],cc[2],cc[3]) else nameFS:SetTextColor(RGB(C.text)) end
+
+            local dynBarW = CARD_W - COL_RANK - COL_NAME - COL_DPS - 10
+            local barBg = FlatTex(card, "BACKGROUND", 1, 1, 1, 0.06)
+            barBg:SetSize(dynBarW, BAR_H)
+            barBg:SetPoint("TOPLEFT", card, "TOPLEFT", COL_RANK + COL_NAME + 2, -ry - (ROW_H - BAR_H) / 2)
+
+            local barPct  = math.max(0.01, math.abs(row.dps) / maxAbs)
+            local fillW   = math.max(2, math.floor(barPct * dynBarW))
+            local barFill = FlatTex(card, "ARTWORK", 1, 1, 1, 0.85)
+            barFill:SetSize(fillW, BAR_H)
+            barFill:SetPoint("TOPLEFT", barBg, "TOPLEFT", 0, 0)
+            if row.isCat then barFill:SetVertexColor(RGB(C.catalyst))
+            elseif row.dps >= 0 then barFill:SetVertexColor(RGB(C.green))
+            else barFill:SetVertexColor(RGB(C.red)) end
+
+            local dpsFS = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            dpsFS:SetSize(COL_DPS, ROW_H)
+            dpsFS:SetPoint("TOPRIGHT", card, "TOPRIGHT", -4, -ry)
+            dpsFS:SetJustifyH("RIGHT"); dpsFS:SetJustifyV("MIDDLE")
+            local sign = row.dps >= 0 and "+" or ""
+            dpsFS:SetText(string.format("%s%.0f", sign, row.dps))
+            if row.isCat then dpsFS:SetTextColor(RGB(C.catalyst))
+            elseif row.dps >= 0 then dpsFS:SetTextColor(RGB(C.green))
+            else dpsFS:SetTextColor(RGB(C.red)) end
+
+            if i < #simRows then
+                local sep = FlatTex(card, "BACKGROUND", RGB(C.border))
+                sep:SetHeight(1)
+                sep:SetPoint("BOTTOMLEFT",  card, "TOPLEFT",  0, -(ry + ROW_H - 1))
+                sep:SetPoint("BOTTOMRIGHT", card, "TOPRIGHT", 0, -(ry + ROW_H - 1))
+            end
+        end
+
+        if cardH > rowMaxH then rowMaxH = cardH end
+        col = col + 1
+        if col >= cols then
+            col      = 0
+            totalH   = totalH + rowMaxH + CARD_GAP
+            rowMaxH  = 0
+        end
+    end
+    if col > 0 then totalH = totalH + rowMaxH + CARD_GAP end
+
+    historyContent:SetWidth(gridW)
+    historyContent:SetHeight(math.max(totalH, 80))
+end
+
+
 -- ── Options section ───────────────────────────────────────────────────────────
 local rcHookBtn = nil
 local function BuildOptionsSection()
     local sec = MakeDrawerSection(drawer, "Options", 0)
-    sec.body:SetHeight(80)
+    sec.body:SetHeight(172)
 
     -- RC snap toggle button
     rcHookBtn = Btn(sec.body, "Unsnap RC", 90, 20, "danger")
@@ -484,7 +1285,10 @@ local function BuildOptionsSection()
         else
             cttLoot_RC:SetSnapEnabled(true)
             rcHookBtn._label:SetText("Unsnap RC")
-            cttLoot_UI:SnapToRC()
+            -- Only snap immediately if a session is currently active
+            if cttLoot_RC:IsSessionActive() then
+                cttLoot_UI:SnapToRC()
+            end
             cttLoot:Print("RC snap enabled.")
         end
     end)
@@ -514,6 +1318,76 @@ local function BuildOptionsSection()
     rcIntLabel:SetTextColor(0.6, 0.6, 0.6)
     rcIntLabel:SetText("RCLootCouncil session tracking")
 
+    -- ── Divider — centred in the gap between Disable RC and History label ──
+    local div = FlatTex(sec.body, "BACKGROUND", RGB(C.border))
+    div:SetHeight(1)
+    div:SetPoint("TOPLEFT",  sec.body, "TOPLEFT",  2, -60)
+    div:SetPoint("TOPRIGHT", sec.body, "TOPRIGHT", -2, -60)
+
+    -- History sub-label
+    local histLabel = sec.body:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    histLabel:SetPoint("TOPLEFT", sec.body, "TOPLEFT", 4, -65)
+    histLabel:SetTextColor(RGB(C.text_dim))
+
+    local function RefreshCount()
+        local n = cttLoot_History and cttLoot_History:Count() or 0
+        histLabel:SetText(n == 1 and "History: 1 decision" or "History: "..n.." decisions")
+    end
+    RefreshCount()
+
+    -- "Delete older than N days" row
+    local pruneLabel = sec.body:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    pruneLabel:SetPoint("TOPLEFT", sec.body, "TOPLEFT", 4, -83)
+    pruneLabel:SetTextColor(RGB(C.text))
+    pruneLabel:SetText("Delete entries older than")
+
+    local daysEB = CreateFrame("EditBox", nil, sec.body)
+    daysEB:SetSize(36, 18)
+    daysEB:SetPoint("LEFT", pruneLabel, "RIGHT", 6, 0)
+    daysEB:SetAutoFocus(false)
+    daysEB:SetMaxLetters(3)
+    daysEB:SetNumeric(true)
+    daysEB:SetFontObject("GameFontNormalSmall")
+    daysEB:SetTextColor(RGB(C.text))
+    daysEB:SetTextInsets(4, 4, 0, 0)
+    daysEB:SetText("30")
+    local daysEBbg = FlatTex(daysEB, "BACKGROUND", RGB(C.bg3))
+    daysEBbg:SetAllPoints(daysEB)
+    PixelBorder(daysEB, C.border)
+    daysEB:SetScript("OnEscapePressed", function(s) s:ClearFocus() end)
+    daysEB:SetScript("OnEnterPressed",  function(s) s:ClearFocus() end)
+
+    local daysLabel2 = sec.body:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    daysLabel2:SetPoint("LEFT", daysEB, "RIGHT", 4, 0)
+    daysLabel2:SetTextColor(RGB(C.text))
+    daysLabel2:SetText("days")
+
+    local pruneBtn = Btn(sec.body, "Prune", 52, 20, "danger")
+    pruneBtn:SetPoint("LEFT", daysLabel2, "RIGHT", 6, 0)
+    pruneBtn:SetScript("OnClick", function()
+        local days = tonumber(daysEB:GetText()) or 30
+        if days < 1 then days = 1 end
+        local n = cttLoot_History and cttLoot_History:PruneOlderThan(days) or 0
+        cttLoot:Print(string.format("Pruned %d history entries older than %d days.", n, days))
+        RefreshCount()
+        if activeTab == "history" then cttLoot_UI:RefreshHistoryTab() end
+    end)
+
+    -- Clear all button
+    local clearAllBtn = Btn(sec.body, "Clear All", 68, 20, "danger")
+    clearAllBtn:SetPoint("TOPLEFT", pruneLabel, "BOTTOMLEFT", 0, -PAD)
+    clearAllBtn:SetScript("OnClick", function()
+        if cttLoot_History then cttLoot_History:ClearAll() end
+        cttLoot:Print("Loot history cleared.")
+        RefreshCount()
+        if activeTab == "history" then cttLoot_UI:RefreshHistoryTab() end
+    end)
+
+    -- Refresh count whenever the section is opened
+    sec.hdr:HookScript("OnClick", function()
+        if sec.open then RefreshCount() end
+    end)
+
     return sec
 end
 -- Returns the filter bar frame; sets module-level label/button refs.
@@ -524,7 +1398,6 @@ local function BuildFilterBar(parent, topAnchor)
     bar:SetPoint("TOPRIGHT", topAnchor, "BOTTOMRIGHT", 0, -PAD)
     Bg(bar, C.bg2)
     PixelBorder(bar, C.border)
-    AccentLeft(bar)
 
     local filtersVisible = true
 
@@ -538,7 +1411,7 @@ local function BuildFilterBar(parent, topAnchor)
     statsLabel:SetTextColor(RGB(C.text_dim))
     cttLoot_UI.statsLabel = statsLabel
 
-    -- Boss dropdown button (LEFT anchor set in relayout)
+    -- Boss dropdown button — anchored once; Relayout only calls SetWidth
     local bossBtn = Btn(bar, "", 150, 20)
     bossDdLabel = bossBtn._label
     bossDdLabel:SetText("Boss")
@@ -553,7 +1426,7 @@ local function BuildFilterBar(parent, topAnchor)
     bossClearBtn:SetScript("OnClick", function() cttLoot_UI:SetBossFilter(nil) end)
     cttLoot_UI.bossClearBtn = bossClearBtn
 
-    -- Item dropdown button
+    -- Item dropdown button — anchored once; Relayout only calls SetWidth
     local itemBtn = Btn(bar, "", 180, 20)
     itemDdLabel = itemBtn._label
     itemDdLabel:SetText("Item")
@@ -573,7 +1446,7 @@ local function BuildFilterBar(parent, topAnchor)
     end)
     cttLoot_UI.itemClearBtn = itemClearBtn
 
-    -- Player dropdown button
+    -- Player dropdown button — anchored once; Relayout only calls SetWidth
     local playerBtn = Btn(bar, "", 120, 20)
     playerDdLabel = playerBtn._label
     playerDdLabel:SetText("Player")
@@ -621,36 +1494,35 @@ local function BuildFilterBar(parent, topAnchor)
     local TOGGLE_W   = 4 + 26 + GAP
     local RIGHT_PAD  = 10
 
+    -- Reserve a fixed pixel budget for the stats label so button widths
+    -- never shift when the label text changes (e.g. boss name appears).
+    local STATS_RESERVE = 160
+    -- Anchors set once here; Relayout only calls SetWidth (no ClearAllPoints/SetPoint).
+    -- This makes OnSizeChanged safe to fire every pixel with no anchor-graph churn.
+    bossBtn:SetPoint("LEFT", toggleBtn, "RIGHT", GAP, 0)
+    itemBtn:SetPoint("LEFT", bossClearBtn, "RIGHT", GAP, 0)
+    playerBtn:SetPoint("LEFT", itemClearBtn, "RIGHT", GAP, 0)
+
+    local _lastBossW, _lastItemW, _lastPlayerW = 0, 0, 0
     local function Relayout()
         local barW = bar:GetWidth()
         if barW < 50 then return end
-        local statsW = statsLabel:GetStringWidth() + RIGHT_PAD
-        -- fixed: toggle + 3*(clearBtn+gap) + statsW
-        local fixed  = TOGGLE_W + (CLEAR_W + GAP) * 3 + statsW
+        local fixed  = TOGGLE_W + (CLEAR_W + GAP) * 3 + (CLEAR_W + GAP) + STATS_RESERVE
         local avail  = math.max(barW - fixed, 120)
         local bossW   = math.floor(avail * 0.30)
         local itemW   = math.floor(avail * 0.40)
         local playerW = avail - bossW - itemW
-
-        bossBtn:ClearAllPoints()
-        bossBtn:SetWidth(bossW)
-        bossBtn:SetPoint("LEFT", toggleBtn, "RIGHT", GAP, 0)
-
-        itemBtn:ClearAllPoints()
-        itemBtn:SetWidth(itemW)
-        itemBtn:SetPoint("LEFT", bossClearBtn, "RIGHT", GAP, 0)
-
-        playerBtn:ClearAllPoints()
-        playerBtn:SetWidth(playerW)
-        playerBtn:SetPoint("LEFT", itemClearBtn, "RIGHT", GAP, 0)
-
-        -- Dropdown panels auto-fit to content; set a minimum matching the button
+        -- Only call SetWidth when the value actually changed — avoids even that cost per pixel
+        if bossW   ~= _lastBossW   then bossBtn:SetWidth(bossW);     _lastBossW   = bossW   end
+        if itemW   ~= _lastItemW   then itemBtn:SetWidth(itemW);     _lastItemW   = itemW   end
+        if playerW ~= _lastPlayerW then playerBtn:SetWidth(playerW); _lastPlayerW = playerW end
         if not bossDdFrame:IsShown()   then bossDdFrame:SetWidth(math.max(bossW, 160))     end
         if not itemDdFrame:IsShown()   then itemDdFrame:SetWidth(math.max(itemW, 200))     end
         if not playerDdFrame:IsShown() then playerDdFrame:SetWidth(math.max(playerW, 140)) end
     end
     bar:SetScript("OnSizeChanged", Relayout)
     bar.Relayout = Relayout
+    C_Timer.After(0, Relayout)
 
     -- ── Toggle filter visibility ──
     local filterElements = { bossBtn, bossArrow, itemBtn, itemArrow, playerBtn, playerArrow }
@@ -666,6 +1538,7 @@ local function BuildFilterBar(parent, topAnchor)
         toggleBtn._label:SetText(visible and "<<" or ">>")
     end
     toggleBtn:SetScript("OnClick", function() SetFiltersVisible(not filtersVisible) end)
+    bar.IsFiltersVisible = function() return filtersVisible end
 
     -- ── Dropdown clicks ──
     bossBtn:SetScript("OnClick", function()
@@ -693,10 +1566,14 @@ local function BuildFilterBar(parent, topAnchor)
 end
 
 -- ── Card grid (ScrollFrame) ───────────────────────────────────────────────────
-local function BuildCardArea(parent, topAnchor)
+local function BuildCardArea(parent, topAnchor, bottomAnchor)
     cardScrollF = CreateFrame("ScrollFrame", nil, parent, "UIPanelScrollFrameTemplate")
-    cardScrollF:SetPoint("TOPLEFT",     topAnchor, "BOTTOMLEFT",  0, -PAD)
-    cardScrollF:SetPoint("BOTTOMRIGHT", parent,    "BOTTOMRIGHT", -22, PAD + 14)
+    cardScrollF:SetPoint("TOPLEFT",  topAnchor, "BOTTOMLEFT",  0, -PAD)
+    if bottomAnchor then
+        cardScrollF:SetPoint("BOTTOMRIGHT", bottomAnchor, "TOPRIGHT", -22, PAD)
+    else
+        cardScrollF:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", -22, PAD + 14)
+    end
 
     Bg(cardScrollF, C.bg3)
     PixelBorder(cardScrollF, C.border)
@@ -733,9 +1610,7 @@ local function GetItemPool()
     local playerRow = selectedPlayer and cttLoot.matrix[cttLoot.playerIndex[selectedPlayer]]
     for _, n in ipairs(source) do
         if not IsCatalyst(n) then
-            local passesAward = not cttLoot_UI.awardedOnly
-                or (cttLoot_RC and cttLoot_RC.GetWinnerForItem(n))
-            if passesAward then
+            if true then
                 if selectedPlayer then
                     local ci = cttLoot.itemIndex[n]
                     if ci and playerRow and playerRow[ci] then
@@ -826,7 +1701,7 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
     -- Card layout
     local info     = cttLoot:GetItemInfo(itemName)
     local hasBoss  = info and info.boss
-    local winner   = cttLoot_RC and cttLoot_RC.GetWinnerForItem(itemName)
+    local winner   = cttLoot:GetWinnerForItem(itemName)
     -- hdrH: 1 line (item only) = 20, 2 lines (item+boss) = 32, 3 lines (item+boss+winner) = 44
     local hdrH = 20
     if hasBoss  then hdrH = 32 end
@@ -897,20 +1772,14 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
     end
 
     hdr:SetScript("OnEnter", function() hdrBg:SetVertexColor(RGB(C.accent2)) end)
-    hdr:SetScript("OnLeave", function() hdrBg:SetVertexColor(RGB(C.card_hdr)) end)    hdr:SetScript("OnClick", function()
+    hdr:SetScript("OnLeave", function() hdrBg:SetVertexColor(RGB(C.card_hdr)) end)
+    hdr:SetScript("OnClick", function()
         CloseDropdowns()
         if cttLoot_UI.selectedItem == itemName then
-            -- clicking same item header → go back to previous view
-            cttLoot_UI.selectedItem = nil
-            -- only reset item dropdown if we're not in loot filter mode
-            if not cttLoot_UI.lootFilter then
-                if itemDdLabel then itemDdLabel:SetText("Item") end
-                if itemClearBtn then itemClearBtn:Hide() end
-            end
+            -- clicking same item header → go back to overview
+            cttLoot_UI:SetSelectedItem(nil)
         else
-            cttLoot_UI.selectedItem = itemName
-            if itemDdLabel then itemDdLabel:SetText(itemName) end
-            if itemClearBtn then itemClearBtn:Show() end
+            cttLoot_UI:SetSelectedItem(itemName)
         end
         cttLoot_UI:Refresh()
     end)
@@ -1003,15 +1872,16 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         end
     end
 
+    card._cardH = cardH   -- store for ReflowCards reposition
     return card, cardH
 end
 
--- Destroy all current card frames
+-- Hide all current card frames (keep parented to cardContent — SetParent(nil)
+-- leaks them to UIParent and they accumulate across resizes causing lag/disappearing)
 local function ClearCards()
     if not cardContent then return end
     for _, c in ipairs(cardPool) do
         c:Hide()
-        c:SetParent(nil)
     end
     cardPool = {}
     activeCards = 0
@@ -1097,6 +1967,7 @@ local function PopulateGrid()
 
     cardContent:SetWidth(gridW)
     cardContent:SetHeight(math.max(totalH, 80))
+    cardContent._lastCols = cols   -- used by ReflowCards to detect column count change
 
     -- Update stats badge
     if statsLabel then
@@ -1108,13 +1979,58 @@ local function PopulateGrid()
     end
 end
 
+-- Reposition existing visible cards to fit a new grid width.
+-- Called after window resize — does NOT create or destroy any frames.
+-- Card content (player rows, deltas) is unchanged; only position/width changes
+-- when cols change. If cols actually changed we fall back to full Refresh.
+local function ReflowCards()
+    if not cardScrollF or not cardContent then return end
+    if #cardPool == 0 then return end  -- no cards yet; nothing to reflow
+
+    local gridW = cardScrollF:GetWidth() - 4
+    if gridW < 10 then return end  -- scroll frame not yet settled; bail
+    local cardW = cttLoot_UI.selectedItem and (gridW - PAD * 2) or CARD_W
+    local cols  = cttLoot_UI.selectedItem and 1
+               or math.max(1, math.floor((gridW + CARD_GAP) / (CARD_W + CARD_GAP)))
+
+    -- If column count changed the layout is structurally different — need full rebuild.
+    -- This is rare (only when window width crosses a column boundary).
+    local prevCols = cardContent._lastCols or cols
+    if cols ~= prevCols then
+        cttLoot_UI:Refresh()
+        return
+    end
+
+    -- Same column count: just reposition each card to its new (ox, oy).
+    local col, totalH, rowMaxH = 0, PAD, 0
+    local rowStart = 1
+    for idx, card in ipairs(cardPool) do
+        local cardH = card._cardH or 80
+        local ox    = PAD + col * (cardW + CARD_GAP)
+        card:ClearAllPoints()
+        card:SetPoint("TOPLEFT", cardContent, "TOPLEFT", ox, -totalH)
+        card:SetWidth(cardW)
+        if cardH > rowMaxH then rowMaxH = cardH end
+        col = col + 1
+        if col >= cols then
+            col      = 0
+            totalH   = totalH + rowMaxH + CARD_GAP
+            rowMaxH  = 0
+        end
+    end
+    if col > 0 then totalH = totalH + rowMaxH + CARD_GAP end
+
+    cardContent:SetWidth(gridW)
+    cardContent:SetHeight(math.max(totalH, 80))
+    cardContent._lastCols = cols
+end
+
 -- ── Shared: build search box + scrollable list inside a dd frame ─────────────
 -- Returns: searchEB, listFrame, listContent
 -- The caller populates listContent and sets its height.
-local DD_SEARCH_H = 22
 local DD_MAX_LIST = 220  -- max height of the scrollable list area
 
-local function BuildDdSearchAndList(ddFrame, ddW)
+BuildDdSearchAndList = function(ddFrame, ddW)
     -- Search box
     local searchEB = CreateFrame("EditBox", nil, ddFrame)
     searchEB:SetHeight(DD_SEARCH_H)
@@ -1145,7 +2061,7 @@ local function BuildDdSearchAndList(ddFrame, ddW)
     searchEB:SetScript("OnEditFocusLost",  function(s) placeholder:SetShown(s:GetText() == "") end)
 
     -- ── Custom scroll frame (no template — scrollbar stays inside) ──
-    local SBAR_W = 8   -- thin scrollbar
+    local SBAR_W = 4   -- thin scrollbar
 
     local listSF = CreateFrame("ScrollFrame", nil, ddFrame)
     listSF:SetPoint("TOPLEFT",  ddFrame, "TOPLEFT",  0, -(DD_SEARCH_H + 4))
@@ -1155,6 +2071,22 @@ local function BuildDdSearchAndList(ddFrame, ddW)
     listContent:SetWidth(ddW - SBAR_W - 2)
     listContent:SetHeight(1)
     listSF:SetScrollChild(listContent)
+
+    -- Thin scrollbar track (right edge, inside) — declared before OnMouseWheel so thumb is in scope
+    local scrollTrack = CreateFrame("Frame", nil, ddFrame)
+    scrollTrack:SetWidth(SBAR_W)
+    scrollTrack:SetPoint("TOPRIGHT",    ddFrame, "TOPRIGHT",    -1, -(DD_SEARCH_H + 5))
+    scrollTrack:SetPoint("BOTTOMRIGHT", ddFrame, "BOTTOMRIGHT", -1,  1)
+    local trackBg = FlatTex(scrollTrack, "BACKGROUND", RGB({0.12, 0.12, 0.12}))
+    trackBg:SetAllPoints(scrollTrack)
+
+    local thumb = CreateFrame("Frame", nil, scrollTrack)
+    thumb:SetWidth(SBAR_W)
+    thumb:SetHeight(20)
+    thumb:SetPoint("TOP", scrollTrack, "TOP", 0, 0)
+    local thumbTex = FlatTex(thumb, "ARTWORK", RGB({0.35, 0.35, 0.40}))
+    thumbTex:SetAllPoints(thumb)
+    thumb:Hide()
 
     -- Mouse wheel scrolling
     listSF:EnableMouseWheel(true)
@@ -1172,22 +2104,6 @@ local function BuildDdSearchAndList(ddFrame, ddW)
             thumb:SetPoint("TOP", scrollTrack, "TOP", 0, -pct * travel)
         end
     end)
-
-    -- Thin scrollbar track (right edge, inside)
-    local scrollTrack = CreateFrame("Frame", nil, ddFrame)
-    scrollTrack:SetWidth(SBAR_W)
-    scrollTrack:SetPoint("TOPRIGHT",    ddFrame, "TOPRIGHT",    -1, -(DD_SEARCH_H + 5))
-    scrollTrack:SetPoint("BOTTOMRIGHT", ddFrame, "BOTTOMRIGHT", -1,  1)
-    local trackBg = FlatTex(scrollTrack, "BACKGROUND", RGB({0.12, 0.12, 0.12}))
-    trackBg:SetAllPoints(scrollTrack)
-
-    local thumb = CreateFrame("Frame", nil, scrollTrack)
-    thumb:SetWidth(SBAR_W)
-    thumb:SetHeight(20)
-    thumb:SetPoint("TOP", scrollTrack, "TOP", 0, 0)
-    local thumbTex = FlatTex(thumb, "ARTWORK", RGB({0.35, 0.35, 0.40}))
-    thumbTex:SetAllPoints(thumb)
-    thumb:Hide()
 
     -- Update thumb on scroll
     local function UpdateThumb()
@@ -1243,12 +2159,15 @@ end
 -- rows is array of { label, onSelect, selected }
 -- listW is the explicit pixel width for row buttons.
 -- Returns total height used.
-local function FillDdList(listContent, listW, rows, query)
-    -- Clear old children (frames + buttons)
+-- Reuses existing child buttons rather than creating new ones every call,
+-- preventing unbounded frame accumulation across repeated dropdown opens.
+FillDdList = function(listContent, listW, rows, query)
+    -- Collect existing reusable buttons (hide them all first)
+    local recycled = {}
     for _, child in ipairs({ listContent:GetChildren() }) do
-        child:Hide(); child:SetParent(nil)
+        child:Hide()
+        table.insert(recycled, child)
     end
-    -- Also clear any regions (fontstrings / textures) created directly
     for _, region in ipairs({ listContent:GetRegions() }) do
         region:Hide()
     end
@@ -1256,36 +2175,72 @@ local function FillDdList(listContent, listW, rows, query)
     local q      = query and query:lower() or ""
     local y      = 0
     local any    = false
-    local maxW   = listW  -- track widest label
+    local maxW   = listW
+    local active = {}   -- buttons shown this pass
+
+    -- First pass: measure max width needed
+    local measurer = listContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    for _, row in ipairs(rows) do
+        if q == "" or row.label:lower():find(q, 1, true) then
+            measurer:SetText(row.label)
+            local tw = measurer:GetStringWidth() + 24
+            if tw > maxW then maxW = tw end
+        end
+    end
+    measurer:Hide()
+
+    -- Second pass: reuse or create buttons
+    local recycleIdx = 1
     for _, row in ipairs(rows) do
         local label = row.label
         if q == "" or label:lower():find(q, 1, true) then
-            -- Measure text width + padding
-            local tmp = listContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-            tmp:SetText(label)
-            local tw = tmp:GetStringWidth() + 24  -- 24px for padding + arrow
-            tmp:Hide()
-            if tw > maxW then maxW = tw end
-            local btn = Btn(listContent, label, maxW, DD_ROW_H)
-            btn:SetPoint("TOPLEFT", listContent, "TOPLEFT", 0, -y)
-            if row.selected then btn._bg:SetVertexColor(RGB(C.accent2)) end
-            local cb = row.onSelect
-            btn:SetScript("OnClick", cb)
+            local btn = recycled[recycleIdx]
+            if btn then
+                recycleIdx = recycleIdx + 1
+                -- Reconfigure existing button
+                btn._label:SetText(label)
+                btn:SetWidth(maxW)
+                btn:SetHeight(DD_ROW_H)
+                btn:ClearAllPoints()
+                btn:SetPoint("TOPLEFT", listContent, "TOPLEFT", 0, -y)
+                btn._bg:SetVertexColor(
+                    row.selected and RGB(C.accent2) or RGB(C.bg3))
+                btn:SetScript("OnClick", row.onSelect)
+                btn:Show()
+            else
+                -- Create new button only when pool exhausted
+                btn = Btn(listContent, label, maxW, DD_ROW_H)
+                btn:SetPoint("TOPLEFT", listContent, "TOPLEFT", 0, -y)
+                if row.selected then btn._bg:SetVertexColor(RGB(C.accent2)) end
+                btn:SetScript("OnClick", row.onSelect)
+            end
+            table.insert(active, btn)
             y   = y + DD_ROW_H + 1
             any = true
         end
     end
-    -- Resize all buttons to the max width
-    for _, child in ipairs({ listContent:GetChildren() }) do
-        child:SetWidth(maxW)
-    end
+
     if not any then
-        local empty = listContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        empty:SetPoint("TOPLEFT", listContent, "TOPLEFT", 8, -6)
-        empty:SetTextColor(RGB(C.text_dim))
-        empty:SetText(q ~= "" and "No match" or "—")
+        -- Show "no match" text in a recycled button or new fontstring
+        local btn = recycled[recycleIdx]
+        if btn then
+            btn._label:SetText(q ~= "" and "No match" or "—")
+            btn._label:SetTextColor(RGB(C.text_dim))
+            btn:SetWidth(maxW); btn:SetHeight(DD_ROW_H)
+            btn:ClearAllPoints()
+            btn:SetPoint("TOPLEFT", listContent, "TOPLEFT", 8, -6)
+            btn._bg:SetVertexColor(RGB(C.bg3))
+            btn:SetScript("OnClick", function() end)
+            btn:Show()
+        else
+            local empty = listContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            empty:SetPoint("TOPLEFT", listContent, "TOPLEFT", 8, -6)
+            empty:SetTextColor(RGB(C.text_dim))
+            empty:SetText(q ~= "" and "No match" or "—")
+        end
         y = y + 20
     end
+
     listContent:SetHeight(math.max(y, 1))
     return y, maxW
 end
@@ -1326,21 +2281,28 @@ function cttLoot_UI:PopulateBossDropdown()
 
     -- Build row descriptors
     bossDdAllRows = {}
-    for _, bossName in ipairs(cttLoot:GetAllBosses()) do
-        local bName = bossName
-        table.insert(bossDdAllRows, {
-            label    = bossName,
-            selected = (self.selectedBoss == bossName),
-            onSelect = function() self:SetBossFilter(bName); CloseDropdowns() end,
-        })
-    end
-    if #bossDdAllRows == 1 then
-        -- only "All Bosses" — add empty notice
+    -- "All Bosses" always first
+    table.insert(bossDdAllRows, {
+        label    = "All Bosses",
+        selected = (self.selectedBoss == nil),
+        onSelect = function() self:SetBossFilter(nil); CloseDropdowns() end,
+    })
+    local allBosses = cttLoot:GetAllBosses()
+    if #allBosses == 0 then
         table.insert(bossDdAllRows, {
             label    = "Database empty — import items first",
             selected = false,
             onSelect = function() end,
         })
+    else
+        for _, bossName in ipairs(allBosses) do
+            local bName = bossName
+            table.insert(bossDdAllRows, {
+                label    = bossName,
+                selected = (self.selectedBoss == bossName),
+                onSelect = function() self:SetBossFilter(bName); CloseDropdowns() end,
+            })
+        end
     end
 
     bossDdSearch:SetText("")
@@ -1389,6 +2351,17 @@ function cttLoot_UI:PopulateItemDropdown()
         if not IsCatalyst(n) then pool[#pool+1] = n end
     end
     itemDdAllRows = {}
+    -- "All Items" always first
+    table.insert(itemDdAllRows, {
+        label    = "All Items",
+        selected = (self.selectedItem == nil),
+        onSelect = function()
+            self.selectedItem = nil
+            if itemDdLabel  then itemDdLabel:SetText("Item") end
+            if itemClearBtn then itemClearBtn:Hide() end
+            CloseDropdowns(); self:Refresh()
+        end,
+    })
     if #pool == 0 then
         table.insert(itemDdAllRows, {
             label    = "No items loaded",
@@ -1404,7 +2377,7 @@ function cttLoot_UI:PopulateItemDropdown()
                 onSelect = function()
                     self.selectedItem = iName
                     if itemDdLabel  then itemDdLabel:SetText(iName) end
-                    if itemClearBtn then itemClearBtn:Show() end
+                    if itemClearBtn and (not filterBar or filterBar.IsFiltersVisible()) then itemClearBtn:Show() end
                     CloseDropdowns(); self:Refresh()
                 end,
             })
@@ -1467,7 +2440,7 @@ function cttLoot_UI:PopulatePlayerDropdown()
             onSelect = function()
                 self.selectedPlayer = pName
                 playerDdLabel:SetText(pName)
-                playerClearBtn:Show()
+                if filterBar and filterBar.IsFiltersVisible() then playerClearBtn:Show() end
                 CloseDropdowns()
                 self:Refresh()
             end,
@@ -1494,7 +2467,7 @@ function cttLoot_UI:SetBossFilter(bossName)
     if bossDdLabel then bossDdLabel:SetText(bossName or "Boss") end
     if itemDdLabel then itemDdLabel:SetText("Item") end
     if bossClearBtn then
-        if bossName then bossClearBtn:Show() else bossClearBtn:Hide() end
+        if bossName and filterBar and filterBar.IsFiltersVisible() then bossClearBtn:Show() else bossClearBtn:Hide() end
     end
     if itemClearBtn then itemClearBtn:Hide() end
     self:Refresh()
@@ -1502,6 +2475,23 @@ end
 
 function cttLoot_UI:SetLootFilter(names)
     self.lootFilter = names
+    -- Updating the loot filter implicitly clears the selected item
+    self.selectedItem = nil
+    if itemDdLabel  then itemDdLabel:SetText("Item") end
+    if itemClearBtn then itemClearBtn:Hide() end
+end
+
+-- Set (or clear) the zoomed item view.  Pass nil to return to the grid.
+-- Handles all label/button sync so callers never touch those locals.
+function cttLoot_UI:SetSelectedItem(name)
+    self.selectedItem = name
+    if name then
+        if itemDdLabel  then itemDdLabel:SetText(name) end
+        if itemClearBtn and filterBar and filterBar.IsFiltersVisible() then itemClearBtn:Show() end
+    else
+        if itemDdLabel  then itemDdLabel:SetText("Item") end
+        if itemClearBtn then itemClearBtn:Hide() end
+    end
 end
 
 function cttLoot_UI:GetVisibleItemsForBoss(bossName)
@@ -1532,7 +2522,24 @@ end
 function cttLoot_UI:Refresh()
     if not window then return end
     BuildClassColors()
-    PopulateGrid()
+    if activeTab == "history" then
+        self:RefreshHistoryTab()
+    else
+        PopulateGrid()
+    end
+end
+
+-- Reposition cards after a window resize without rebuilding them.
+function cttLoot_UI:ReflowCards()
+    if not window then return end
+    if activeTab == "history" then
+        -- History tab: just update content width, no card reposition needed
+        if historyScrollF and historyContent then
+            historyContent:SetWidth(historyScrollF:GetWidth() - 4)
+        end
+    else
+        ReflowCards()
+    end
 end
 
 function cttLoot_UI:ToggleDrawer()
@@ -1599,9 +2606,6 @@ end
 
 function cttLoot_UI:ResetAwardFilter()
     self.awardedOnly = false
-    if awardedFilterBtn then
-        awardedFilterBtn._label:SetTextColor(RGB(C.text_dim))
-    end
 end
 
 function cttLoot_UI:Build()
@@ -1683,58 +2687,88 @@ function cttLoot_UI:Build()
     closeBtn:SetScript("OnClick", function()
         window:Hide(); CloseDropdowns()
         if drawer then drawer:Hide(); drawerOpen = false end
+        if syncCogColor then syncCogColor() end
     end)
 
-    -- Settings button (same height as X, left of close button)
+    -- Settings button — white when closed, green when open
     local cogBtn = Btn(window, "Settings", 60, 18)
     cogBtn:SetPoint("RIGHT", closeBtn, "LEFT", -2, 0)
+    cogBtn._label:SetTextColor(RGB(C.text_hi))  -- starts white (drawer closed)
+    local function SetCogColor()
+        if drawerOpen then
+            cogBtn._label:SetTextColor(RGB(C.green))
+        else
+            cogBtn._label:SetTextColor(RGB(C.text_hi))
+        end
+    end
+    syncCogColor = SetCogColor  -- expose to drawer X and window close
     cogBtn:SetScript("OnClick", function()
         drawerOpen = not drawerOpen
         if drawerOpen then drawer:Show() else drawer:Hide() end
+        SetCogColor()
+    end)
+    cogBtn:SetScript("OnEnter", function()
+        cogBtn._bg:SetVertexColor(RGB(C.accent2))
+        SetCogColor()
+    end)
+    cogBtn:SetScript("OnLeave", function()
+        cogBtn._bg:SetVertexColor(RGB(C.bg3))
+        SetCogColor()
+    end)
+    cogBtn:SetScript("OnMouseDown", function()
+        cogBtn._bg:SetVertexColor(RGB(C.accent))
+        SetCogColor()
+    end)
+    cogBtn:SetScript("OnMouseUp", function()
+        cogBtn._bg:SetVertexColor(RGB(C.bg3))
+        SetCogColor()
     end)
 
-    -- Check button (left of Settings)
+    -- Check button — white normally, green for 3s while check is live
     local checkBtn = Btn(window, "Check", 50, 18)
     checkBtn:SetPoint("RIGHT", cogBtn, "LEFT", -2, 0)
+    checkBtn._label:SetTextColor(RGB(C.text_hi))
+    local checkActive = false
+    local checkPulseTimer = nil
+    local function SetCheckColor()
+        if checkActive then
+            checkBtn._label:SetTextColor(RGB(C.green))
+        else
+            checkBtn._label:SetTextColor(RGB(C.text_hi))
+        end
+    end
     checkBtn:SetScript("OnClick", function()
+        if #cttLoot.itemNames == 0 then return end  -- RunCheck will print the error
+        checkActive = true
+        SetCheckColor()
+        if checkPulseTimer then checkPulseTimer:Cancel() end
+        checkPulseTimer = C_Timer.NewTimer(3, function()
+            checkPulseTimer = nil
+            checkActive = false
+            SetCheckColor()
+        end)
         cttLoot:RunCheck()
     end)
+    checkBtn:SetScript("OnEnter", function()
+        checkBtn._bg:SetVertexColor(RGB(C.accent2))
+        SetCheckColor()
+    end)
+    checkBtn:SetScript("OnLeave", function()
+        checkBtn._bg:SetVertexColor(RGB(C.bg3))
+        SetCheckColor()
+    end)
+    checkBtn:SetScript("OnMouseDown", function()
+        checkBtn._bg:SetVertexColor(RGB(C.accent))
+        SetCheckColor()
+    end)
+    checkBtn:SetScript("OnMouseUp", function()
+        checkBtn._bg:SetVertexColor(RGB(C.bg3))
+        SetCheckColor()
+    end)
 
-    -- Awarded filter button (left of Check)
-    awardedFilterBtn = Btn(window, "Awarded", 60, 18)
-    awardedFilterBtn:SetPoint("RIGHT", checkBtn, "LEFT", -2, 0)
-    awardedFilterBtn._label:SetTextColor(RGB(C.text_dim))
-    awardedFilterBtn:SetScript("OnClick", function()
-        cttLoot_UI.awardedOnly = not cttLoot_UI.awardedOnly
-        if cttLoot_UI.awardedOnly then
-            awardedFilterBtn._label:SetTextColor(RGB(C.green))
-        else
-            awardedFilterBtn._label:SetTextColor(RGB(C.text_dim))
-        end
-        cttLoot_UI:Refresh()
-    end)
-    -- Override OnLeave/OnMouseUp to restore active-aware color instead of default
-    awardedFilterBtn:SetScript("OnLeave", function()
-        awardedFilterBtn._bg:SetVertexColor(RGB(C.bg3))
-        if cttLoot_UI.awardedOnly then
-            awardedFilterBtn._label:SetTextColor(RGB(C.green))
-        else
-            awardedFilterBtn._label:SetTextColor(RGB(C.text_dim))
-        end
-    end)
-    awardedFilterBtn:SetScript("OnMouseUp", function()
-        awardedFilterBtn._bg:SetVertexColor(RGB(C.bg3))
-        if cttLoot_UI.awardedOnly then
-            awardedFilterBtn._label:SetTextColor(RGB(C.green))
-        else
-            awardedFilterBtn._label:SetTextColor(RGB(C.text_dim))
-        end
-    end)
-    cttLoot_UI.awardedFilterBtn = awardedFilterBtn
-
-    -- Sort button (left of Awarded) — on by default (delta), off = alphabetical
+    -- Sort button (left of Check) — on by default (delta), off = alphabetical
     sortFilterBtn = Btn(window, "Delta", 45, 18)
-    sortFilterBtn:SetPoint("RIGHT", awardedFilterBtn, "LEFT", -2, 0)
+    sortFilterBtn:SetPoint("RIGHT", checkBtn, "LEFT", -2, 0)
     sortFilterBtn._label:SetTextColor(RGB(C.green))  -- on by default
     sortFilterBtn:SetScript("OnClick", function()
         cttLoot_UI.sortByDelta = not cttLoot_UI.sortByDelta
@@ -1762,21 +2796,25 @@ function cttLoot_UI:Build()
         end
     end)
 
-    -- Resize grip
+    -- Resize grip — sits at bottom-right corner, on top of footer bar
     local grip = CreateFrame("Button", nil, window)
     grip:SetSize(16, 16)
     grip:SetPoint("BOTTOMRIGHT", window, "BOTTOMRIGHT", -2, 2)
+    grip:SetFrameLevel(window:GetFrameLevel() + 20)
     local gripTex = grip:CreateTexture(nil, "OVERLAY")
     gripTex:SetAllPoints(grip)
     gripTex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+    -- Freeze/restore helpers: during resize the scroll frames must NOT be
+    -- two-anchor elastic frames — that causes WoW to recalculate the entire
+    -- descendant hierarchy every pixel, which is what causes the lag.
     grip:SetScript("OnMouseDown", function()
-        window:SetMovable(true)  -- temporarily allow sizing even if snapped
+        window:SetMovable(true)
         window:StartSizing("BOTTOMRIGHT")
     end)
     grip:SetScript("OnMouseUp", function()
         window:StopMovingOrSizing()
         -- Restore snap lock if RC integration is active
-        if cttLoot_RC:IsEnabled() then
+        if cttLoot_RC:IsEnabled() and cttLoot_RC:IsSessionActive() then
             window:SetMovable(false)
             cttLoot_UI:SnapToRC()
         else
@@ -1791,18 +2829,37 @@ function cttLoot_UI:Build()
         end
     end)
 
-    -- Reflow scroll frame and save size whenever window size changes
+    -- After resize: reflow layout only — never rebuild cards from scratch.
+    -- Cards are expensive to create (20+ sub-frames each). Rebuilding them on
+    -- every resize causes unbounded frame accumulation in cardContent.
+    -- Instead we just reposition existing cards to fit the new width.
     local resizeTimer = nil
     window:SetScript("OnSizeChanged", function()
         if resizeTimer then resizeTimer:Cancel() end
-        resizeTimer = C_Timer.NewTimer(0.15, function()
+        resizeTimer = C_Timer.NewTimer(0.2, function()
             resizeTimer = nil
             if not cardScrollF or not cardContent then return end
-            cardScrollF:SetPoint("BOTTOMRIGHT", window, "BOTTOMRIGHT", -22, PAD + 14)
-            cardContent:SetWidth(cardScrollF:GetWidth())
+
+            -- Update content frame widths (guard against zero — frame may not have settled)
+            local csW = cardScrollF:GetWidth()
+            if csW > 10 then cardContent:SetWidth(csW) end
+            if historyScrollF and historyContent then
+                local hsW = historyScrollF:GetWidth()
+                if hsW > 10 then historyContent:SetWidth(hsW - 4) end
+            end
+
+            -- Relayout filter bars
+            if filterBar and filterBar.Relayout then filterBar.Relayout() end
+            if historyFilterBar and historyFilterBar.Relayout then historyFilterBar.Relayout() end
+
+            -- Save new size
             cttLootDB.windowW = math.floor(window:GetWidth())
             cttLootDB.windowH = math.floor(window:GetHeight())
-            cttLoot_UI:Refresh()
+
+            -- Reflow cards to new width WITHOUT recreating them.
+            -- Full Refresh() (which recreates all cards) is only needed when
+            -- data or filters change, not when the window is resized.
+            cttLoot_UI:ReflowCards()
         end)
     end)
 
@@ -1815,11 +2872,99 @@ function cttLoot_UI:Build()
     BuildOptionsSection()
     self:RepositionDrawer()
 
-    -- ── Filter bar (anchored below title bar) ──
+    -- ── Filter bar (anchored below title bar, as before) ──
     filterBar = BuildFilterBar(window, titleBar)
 
-    -- ── Card grid (fills remaining space below filter bar) ──
-    BuildCardArea(window, filterBar)
+    -- ── Footer tab bar (pinned to window bottom, above resize grip) ──
+    local FOOTER_H = 22
+    local footerBar = CreateFrame("Frame", nil, window)
+    footerBar:SetHeight(FOOTER_H)
+    footerBar:SetPoint("BOTTOMLEFT",  window, "BOTTOMLEFT",  1, 1)
+    footerBar:SetPoint("BOTTOMRIGHT", window, "BOTTOMRIGHT", -1, 1)
+    Bg(footerBar, C.bg_title)
+
+    -- Accent line on TOP of footer (separates content from footer)
+    local footerAccent = FlatTex(window, "ARTWORK", RGB(C.accent))
+    footerAccent:SetHeight(1)
+    footerAccent:SetPoint("BOTTOMLEFT",  footerBar, "TOPLEFT",  0, 0)
+    footerAccent:SetPoint("BOTTOMRIGHT", footerBar, "TOPRIGHT", 0, 0)
+
+    -- Per-tab active underline (TOP edge of button = top of footer bar)
+    local gridUnderline    = FlatTex(footerBar, "OVERLAY", RGB(C.accent))
+    local historyUnderline = FlatTex(footerBar, "OVERLAY", RGB(C.accent))
+    gridUnderline:SetHeight(2)
+    historyUnderline:SetHeight(2)
+
+    local function SetTabActive(btn, underline, active)
+        if active then
+            btn._bg:SetVertexColor(RGB(C.bg2))
+            btn._label:SetTextColor(RGB(C.text_hi))
+            underline:Show()
+        else
+            btn._bg:SetVertexColor(RGB(C.bg_title))
+            btn._label:SetTextColor(RGB(C.text_dim))
+            underline:Hide()
+        end
+        if not active then
+            btn:SetScript("OnEnter",     function() btn._label:SetTextColor(RGB(C.text)) end)
+            btn:SetScript("OnLeave",     function() btn._label:SetTextColor(RGB(C.text_dim)) end)
+            btn:SetScript("OnMouseDown", function() end)
+            btn:SetScript("OnMouseUp",   function() end)
+        else
+            btn:SetScript("OnEnter",     function() end)
+            btn:SetScript("OnLeave",     function() end)
+            btn:SetScript("OnMouseDown", function() end)
+            btn:SetScript("OnMouseUp",   function() end)
+        end
+    end
+
+    tabGridBtn    = Btn(footerBar, "Main",    56, FOOTER_H - 2)
+    tabHistoryBtn = Btn(footerBar, "History", 64, FOOTER_H - 2)
+    tabGridBtn:SetPoint("LEFT",    footerBar, "LEFT", 6, 0)
+    tabHistoryBtn:SetPoint("LEFT", tabGridBtn, "RIGHT", 2, 0)
+
+    -- Underlines sit on the TOP edge of each button (visible above content area)
+    gridUnderline:SetPoint("TOPLEFT",  tabGridBtn,    "TOPLEFT",  0, 0)
+    gridUnderline:SetPoint("TOPRIGHT", tabGridBtn,    "TOPRIGHT", 0, 0)
+    historyUnderline:SetPoint("TOPLEFT",  tabHistoryBtn, "TOPLEFT",  0, 0)
+    historyUnderline:SetPoint("TOPRIGHT", tabHistoryBtn, "TOPRIGHT", 0, 0)
+
+    SetTabActive(tabGridBtn,    gridUnderline,    true)
+    SetTabActive(tabHistoryBtn, historyUnderline, false)
+
+    tabGridBtn:SetScript("OnClick", function()
+        if activeTab == "grid" then return end
+        activeTab = "grid"
+        historySelectedItem = nil
+        historyDetailEntry  = nil
+        SetTabActive(tabGridBtn,    gridUnderline,    true)
+        SetTabActive(tabHistoryBtn, historyUnderline, false)
+        filterBar:Show()
+        if cardScrollF      then cardScrollF:Show()      end
+        if historyFilterBar then historyFilterBar:Hide() end
+        if historyScrollF   then historyScrollF:Hide()   end
+        cttLoot_UI:Refresh()
+    end)
+    tabHistoryBtn:SetScript("OnClick", function()
+        if activeTab == "history" then return end
+        activeTab = "history"
+        SetTabActive(tabGridBtn,    gridUnderline,    false)
+        SetTabActive(tabHistoryBtn, historyUnderline, true)
+        filterBar:Hide()
+        if cardScrollF    then cardScrollF:Hide()    end
+        if historyFilterBar then historyFilterBar:Show() end
+        if historyScrollF then historyScrollF:Show() end
+        cttLoot_UI:RefreshHistoryTab()
+    end)
+
+    -- ── Card grid (fills space between filter bar and footer) ──
+    BuildCardArea(window, filterBar, footerBar)
+
+    -- ── History filter bar (hidden until history tab active) ──
+    BuildHistoryFilterBar(window, titleBar)
+
+    -- ── History area (anchored below history filter bar) ──
+    BuildHistoryArea(window, titleBar, footerBar)
 
     window:Hide()
 end
