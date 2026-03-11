@@ -64,9 +64,17 @@ local cardScrollF   = nil    -- ScrollFrame for card grid
 local filterBar     = nil    -- Filter bar (for relayout after stats update)
 local sortFilterBtn    = nil -- Sort-by-delta toggle button
 local cardContent   = nil    -- content frame inside scroll
-local cardPool      = {}     -- reuse frames: cardPool[i] = frame
+local cardPool      = {}     -- active cards in the current grid
 local activeCards   = 0
 local emptyLabel    = nil    -- reusable "no data" hint label
+
+-- ── Card recycle pool ─────────────────────────────────────────────────────────
+-- Pooled cards live in cardGraveyard (off-screen, hidden) when not displayed.
+-- Each has MAX_CARD_ROWS pre-built row slots — show/hide slots as needed.
+-- Keeps frame count flat across resizes; no allocations during grid rebuild.
+local MAX_CARD_ROWS   = 10        -- matches overview rowLimit cap
+local cardGraveyard   = nil       -- hidden frame; pooled cards parent here
+local cardRecyclePool = {}        -- { card, ... } available for reuse
 
 -- ── Tab state ─────────────────────────────────────────────────────────────────
 local activeTab            = "grid"   -- "grid" | "history"
@@ -1661,11 +1669,245 @@ local function GetItemPoolSorted()
     return pool
 end
 
+-- ── Card pool: init / acquire / release / configure ──────────────────────────
+-- All pool functions must be declared BEFORE MakeCard which calls them.
+
+local function InitCardPool()
+    if cardGraveyard then return end
+    cardGraveyard = CreateFrame("Frame", nil, UIParent)
+    cardGraveyard:Hide()
+    cardGraveyard:SetPoint("TOPLEFT", UIParent, "TOPLEFT", -9999, 9999)
+    cardGraveyard:SetSize(1, 1)
+end
+
+-- Move a pooled card out of the scene into the graveyard.
+-- Re-parenting removes it from cardContent's child list so WoW stops
+-- processing it in layout passes — the key fix for progressive slowdown.
+local function ReleaseCard(card)
+    card:SetParent(cardGraveyard)
+    card:ClearAllPoints()
+    card:Hide()
+    cardRecyclePool[#cardRecyclePool + 1] = card
+end
+
 -- Per-player best item lookup (populated before each grid render)
 local playerBestItem = {}
 
--- Build one card frame for `itemName` at position (ox, oy) relative to cardContent
--- Returns the card frame (or nil) and its total height.
+-- Build one card with every possible element pre-created and hidden.
+-- MAX_CARD_ROWS row slots let any overview item be displayed without
+-- allocating new frames.  Parented to cardGraveyard until acquired.
+
+local function CreatePooledCard()
+    local card = CreateFrame("Frame", nil, cardGraveyard)
+    card:SetSize(CARD_W, 80)
+    Bg(card, C.card_bg)
+    PixelBorder(card, C.border)
+
+    local hdr = CreateFrame("Button", nil, card)
+    hdr:SetHeight(20)
+    hdr:SetPoint("TOPLEFT"); hdr:SetPoint("TOPRIGHT")
+    local hdrBg = Bg(hdr, C.card_hdr)
+
+    local titleFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    titleFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -4)
+    titleFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -4)
+    titleFS:SetHeight(12); titleFS:SetJustifyH("LEFT")
+    titleFS:SetWordWrap(false); titleFS:SetNonSpaceWrap(false)
+
+    local bossFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    bossFS:SetHeight(12); bossFS:SetJustifyH("LEFT")
+    bossFS:SetWordWrap(false); bossFS:SetNonSpaceWrap(false)
+    bossFS:SetTextColor(RGB(C.accent)); bossFS:Hide()
+
+    local winnerFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    winnerFS:SetHeight(12); winnerFS:SetWordWrap(false); winnerFS:SetNonSpaceWrap(false)
+    winnerFS:SetTextColor(0.2, 1, 0.2, 1); winnerFS:Hide()
+
+    local dimTex = card:CreateTexture(nil, "OVERLAY")
+    dimTex:SetAllPoints(card); dimTex:SetColorTexture(0, 0, 0, 0.5); dimTex:Hide()
+
+    local rows = {}
+    for i = 1, MAX_CARD_ROWS do
+        local ar, ag, ab = RGB(C.accent)
+        local bestBg  = FlatTex(card, "BACKGROUND", ar, ag, ab, 0.15); bestBg:Hide()
+        local rowBg   = FlatTex(card, "BACKGROUND", 1, 1, 1, 0.03);    rowBg:Hide()
+        local rankFS  = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        rankFS:SetSize(COL_RANK, ROW_H)
+        rankFS:SetJustifyH("CENTER"); rankFS:SetJustifyV("MIDDLE"); rankFS:Hide()
+        local nameFS  = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        nameFS:SetSize(COL_NAME, ROW_H)
+        nameFS:SetJustifyH("LEFT"); nameFS:SetJustifyV("MIDDLE"); nameFS:Hide()
+        local barBg   = FlatTex(card, "BACKGROUND", 1, 1, 1, 0.06); barBg:Hide()
+        local barFill = FlatTex(card, "ARTWORK",     1, 1, 1, 0.85); barFill:Hide()
+        local dpsFS   = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        dpsFS:SetSize(COL_DPS, ROW_H)
+        dpsFS:SetJustifyH("RIGHT"); dpsFS:SetJustifyV("MIDDLE"); dpsFS:Hide()
+        local sep = FlatTex(card, "BACKGROUND", RGB(C.border))
+        sep:SetHeight(1); sep:Hide()
+        rows[i] = { bestBg=bestBg, rowBg=rowBg, rankFS=rankFS, nameFS=nameFS,
+                    barBg=barBg, barFill=barFill, dpsFS=dpsFS, sep=sep }
+    end
+
+    -- Scripts are set once here and reference card._itemName so no re-wiring
+    -- is needed on reconfigure — only card._itemName is updated each time.
+    hdr:SetScript("OnEnter", function() hdrBg:SetVertexColor(RGB(C.accent2)) end)
+    hdr:SetScript("OnLeave", function() hdrBg:SetVertexColor(RGB(C.card_hdr)) end)
+    hdr:SetScript("OnClick", function()
+        CloseDropdowns()
+        if cttLoot_UI.selectedItem == card._itemName then
+            cttLoot_UI:SetSelectedItem(nil)
+        else
+            cttLoot_UI:SetSelectedItem(card._itemName)
+        end
+        cttLoot_UI:Refresh()
+    end)
+
+    card._p = { hdr=hdr, hdrBg=hdrBg, titleFS=titleFS, bossFS=bossFS,
+                winnerFS=winnerFS, dimTex=dimTex, rows=rows }
+    return card
+end
+
+local function AcquireCard()
+    if #cardRecyclePool > 0 then
+        local c = cardRecyclePool[#cardRecyclePool]
+        cardRecyclePool[#cardRecyclePool] = nil
+        return c
+    end
+    return CreatePooledCard()
+end
+
+-- Reconfigure a pooled card in-place for a new item.
+-- Updates position, size, header, and all row slots without creating any frames.
+local function ConfigureCard(card, itemName, entries, maxAbs, ox, oy, cardW, hdrH, cardH, info, winner)
+    local p = card._p
+    card._itemName = itemName
+    card._cardH    = cardH
+
+    card:SetParent(cardContent)
+    card:SetSize(cardW, cardH)
+    card:ClearAllPoints()
+    card:SetPoint("TOPLEFT", cardContent, "TOPLEFT", ox, -oy)
+    card:Show()
+
+    p.hdr:SetHeight(hdrH)
+    p.titleFS:SetTextColor(RGB(C.text_hi))
+    p.titleFS:SetText(itemName)
+
+    if info and info.boss then
+        p.bossFS:ClearAllPoints()
+        p.bossFS:SetPoint("TOPLEFT",  p.hdr, "TOPLEFT",  6, -17)
+        p.bossFS:SetPoint("TOPRIGHT", p.hdr, "TOPRIGHT", -4, -17)
+        p.bossFS:SetText(info.boss); p.bossFS:Show()
+    else
+        p.bossFS:Hide()
+    end
+
+    if winner then
+        p.winnerFS:ClearAllPoints()
+        if info and info.boss then
+            p.winnerFS:SetPoint("TOPLEFT",  p.hdr, "TOPLEFT",  6, -29)
+            p.winnerFS:SetPoint("TOPRIGHT", p.hdr, "TOPRIGHT", -4, -29)
+            p.winnerFS:SetJustifyH("LEFT")
+        else
+            p.winnerFS:SetPoint("TOPLEFT",  p.hdr, "TOPLEFT",  6, -4)
+            p.winnerFS:SetPoint("TOPRIGHT", p.hdr, "TOPRIGHT", -4, -4)
+            p.winnerFS:SetJustifyH("RIGHT")
+        end
+        p.winnerFS:SetText(">> " .. winner); p.winnerFS:Show()
+        if not cttLoot_UI.selectedItem then p.dimTex:Show() else p.dimTex:Hide() end
+    else
+        p.winnerFS:Hide(); p.dimTex:Hide()
+    end
+
+    local dynBarW = cardW - COL_RANK - COL_NAME - COL_DPS - 10
+    for i = 1, MAX_CARD_ROWS do
+        local slot = p.rows[i]
+        local e    = entries[i]
+        if e then
+            local ry     = hdrH + (i - 1) * ROW_H
+            local isBest = not e.isCat and (playerBestItem[e.player] == itemName)
+
+            if isBest then
+                slot.bestBg:SetSize(cardW, ROW_H)
+                slot.bestBg:ClearAllPoints()
+                slot.bestBg:SetPoint("TOPLEFT", card, "TOPLEFT", 0, -ry)
+                slot.bestBg:Show(); slot.rowBg:Hide()
+            elseif i % 2 == 0 then
+                slot.rowBg:SetSize(cardW, ROW_H)
+                slot.rowBg:ClearAllPoints()
+                slot.rowBg:SetPoint("TOPLEFT", card, "TOPLEFT", 0, -ry)
+                slot.rowBg:Show(); slot.bestBg:Hide()
+            else
+                slot.bestBg:Hide(); slot.rowBg:Hide()
+            end
+
+            slot.rankFS:ClearAllPoints()
+            slot.rankFS:SetPoint("TOPLEFT", card, "TOPLEFT", 2, -ry)
+            if     i == 1 then slot.rankFS:SetTextColor(RGB(C.rank_gold))
+            elseif i == 2 then slot.rankFS:SetTextColor(RGB(C.rank_silver))
+            elseif i == 3 then slot.rankFS:SetTextColor(RGB(C.rank_bronze))
+            else               slot.rankFS:SetTextColor(RGB(C.text_dim)) end
+            slot.rankFS:SetText(tostring(i)); slot.rankFS:Show()
+
+            slot.nameFS:ClearAllPoints()
+            slot.nameFS:SetPoint("TOPLEFT", card, "TOPLEFT", COL_RANK + 2, -ry)
+            local cc = GetClassColor(e.player)
+            if e.isCat then
+                slot.nameFS:SetText(e.player .. " " .. Clr(C.catalyst, "(cat)"))
+            else
+                slot.nameFS:SetText(e.player)
+            end
+            if cc then slot.nameFS:SetTextColor(cc[1], cc[2], cc[3])
+            else       slot.nameFS:SetTextColor(RGB(C.text)) end
+            slot.nameFS:Show()
+
+            slot.barBg:SetSize(dynBarW, BAR_H)
+            slot.barBg:ClearAllPoints()
+            slot.barBg:SetPoint("TOPLEFT", card, "TOPLEFT",
+                COL_RANK + COL_NAME + 2, -ry - (ROW_H - BAR_H) / 2)
+            slot.barBg:Show()
+
+            local barPct  = math.max(0.01, math.abs(e.dps) / maxAbs)
+            local fillW   = math.max(2, math.floor(barPct * dynBarW))
+            slot.barFill:SetSize(fillW, BAR_H)
+            slot.barFill:ClearAllPoints()
+            slot.barFill:SetPoint("TOPLEFT", slot.barBg, "TOPLEFT", 0, 0)
+            if e.isCat then         slot.barFill:SetVertexColor(RGB(C.catalyst))
+            elseif e.dps >= 0 then  slot.barFill:SetVertexColor(RGB(C.green))
+            else                    slot.barFill:SetVertexColor(RGB(C.red)) end
+            slot.barFill:Show()
+
+            slot.dpsFS:ClearAllPoints()
+            slot.dpsFS:SetPoint("TOPRIGHT", card, "TOPRIGHT", -4, -ry)
+            local sign = e.dps >= 0 and "+" or ""
+            slot.dpsFS:SetText(string.format("%s%.0f", sign, e.dps))
+            if e.isCat then         slot.dpsFS:SetTextColor(RGB(C.catalyst))
+            elseif e.dps >= 0 then  slot.dpsFS:SetTextColor(RGB(C.green))
+            else                    slot.dpsFS:SetTextColor(RGB(C.red)) end
+            slot.dpsFS:Show()
+
+            if i < #entries then
+                slot.sep:ClearAllPoints()
+                slot.sep:SetPoint("BOTTOMLEFT",  card, "TOPLEFT",  0, -(ry + ROW_H - 1))
+                slot.sep:SetPoint("BOTTOMRIGHT", card, "TOPRIGHT", 0, -(ry + ROW_H - 1))
+                slot.sep:Show()
+            else
+                slot.sep:Hide()
+            end
+        else
+            slot.bestBg:Hide(); slot.rowBg:Hide()
+            slot.rankFS:Hide(); slot.nameFS:Hide()
+            slot.barBg:Hide();  slot.barFill:Hide()
+            slot.dpsFS:Hide();  slot.sep:Hide()
+        end
+    end
+end
+
+-- Build or reconfigure a card for `itemName` at (ox, oy) in cardContent.
+-- Overview (limit > 0): acquires a pooled card and configures it in-place —
+--   zero frame allocations after the pool is warm.
+-- Detail view (limit == 0): builds a fresh card with unlimited rows — this
+--   path is only reached once per item selection (never on resize).
 local function MakeCard(itemName, ox, oy, limit, cardW)
     cardW = cardW or CARD_W
     local ci = cttLoot.itemIndex[itemName]
@@ -1681,7 +1923,6 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
             local row = cttLoot.matrix[r]
             local base = row and row[ci]
             local cat  = catCi and row and row[catCi]
-            -- In overview (no item zoom), hide negative deltas
             local showNeg = cttLoot_UI.selectedItem ~= nil
             if base and (showNeg or base >= 0) then table.insert(entries, { player=player, dps=base, isCat=false }) end
             if cat  and (showNeg or cat  >= 0) then table.insert(entries, { player=player, dps=cat,  isCat=true  }) end
@@ -1698,16 +1939,25 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         if math.abs(e.dps) > maxAbs then maxAbs = math.abs(e.dps) end
     end
 
-    -- Card layout
-    local info     = cttLoot:GetItemInfo(itemName)
-    local hasBoss  = info and info.boss
-    local winner   = cttLoot:GetWinnerForItem(itemName)
-    -- hdrH: 1 line (item only) = 20, 2 lines (item+boss) = 32, 3 lines (item+boss+winner) = 44
+    local info    = cttLoot:GetItemInfo(itemName)
+    local hasBoss = info and info.boss
+    local winner  = cttLoot:GetWinnerForItem(itemName)
     local hdrH = 20
-    if hasBoss  then hdrH = 32 end
+    if hasBoss        then hdrH = 32 end
     if hasBoss and winner then hdrH = 44 end
-    local cardH    = hdrH + #entries * ROW_H + 2
+    local cardH = hdrH + #entries * ROW_H + 2
 
+    -- ── Overview: zero-allocation pooled card ─────────────────────────────────
+    if limit and limit > 0 then
+        local card = AcquireCard()
+        ConfigureCard(card, itemName, entries, maxAbs, ox, oy, cardW, hdrH, cardH, info, winner)
+        return card, cardH
+    end
+
+    -- ── Detail view (unlimited rows): build fresh ─────────────────────────────
+    -- Only one card exists in detail view and it is rebuilt only on item-selection
+    -- changes (user clicks), never during resize.  Fresh cards are parked in
+    -- cardGraveyard on ClearCards — removed from cardContent's child list.
     local card = CreateFrame("Frame", nil, cardContent)
     card:SetSize(cardW, cardH)
     card:SetPoint("TOPLEFT", cardContent, "TOPLEFT", ox, -oy)
@@ -1715,13 +1965,11 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
     Bg(card, C.card_bg)
     PixelBorder(card, C.border)
 
-    -- Header button (clicking zooms to single-item view)
     local hdr = CreateFrame("Button", nil, card)
     hdr:SetHeight(hdrH)
     hdr:SetPoint("TOPLEFT"); hdr:SetPoint("TOPRIGHT")
     local hdrBg = Bg(hdr, C.card_hdr)
 
-    -- Item name (.ov-title)
     local titleFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     titleFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -4)
     titleFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -4)
@@ -1732,7 +1980,6 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
     titleFS:SetWordWrap(false)
     titleFS:SetNonSpaceWrap(false)
 
-    -- Boss sub-label
     if hasBoss then
         local bossFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         bossFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -17)
@@ -1745,7 +1992,6 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         bossFS:SetNonSpaceWrap(false)
     end
 
-    -- Winner stamp — shown when RC has awarded this item
     if winner then
         local winnerFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         if hasBoss then
@@ -1762,13 +2008,7 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         winnerFS:SetNonSpaceWrap(false)
         winnerFS:SetTextColor(0.2, 1, 0.2, 1)
         winnerFS:SetText(">> " .. winner)
-
-        -- Dim the entire card only in overview grid (not when zoomed into single-item view)
-        if not cttLoot_UI.selectedItem then
-            local dimTex = card:CreateTexture(nil, "OVERLAY")
-            dimTex:SetAllPoints(card)
-            dimTex:SetColorTexture(0, 0, 0, 0.5)
-        end
+        -- Detail view: selectedItem is always set here so never dim
     end
 
     hdr:SetScript("OnEnter", function() hdrBg:SetVertexColor(RGB(C.accent2)) end)
@@ -1776,7 +2016,6 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
     hdr:SetScript("OnClick", function()
         CloseDropdowns()
         if cttLoot_UI.selectedItem == itemName then
-            -- clicking same item header → go back to overview
             cttLoot_UI:SetSelectedItem(nil)
         else
             cttLoot_UI:SetSelectedItem(itemName)
@@ -1784,11 +2023,9 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         cttLoot_UI:Refresh()
     end)
 
-    -- Rows
     for i, e in ipairs(entries) do
         local ry = hdrH + (i-1) * ROW_H
 
-        -- Gold highlight if this is the player's best item
         local isBest = not e.isCat and (playerBestItem[e.player] == itemName)
         if isBest then
             local ar, ag, ab = RGB(C.accent)
@@ -1801,7 +2038,6 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
             rowBg:SetPoint("TOPLEFT", card, "TOPLEFT", 0, -ry)
         end
 
-        -- Rank badge (.ov-rank)
         local rankFS = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         rankFS:SetSize(COL_RANK, ROW_H)
         rankFS:SetPoint("TOPLEFT", card, "TOPLEFT", 2, -ry)
@@ -1812,7 +2048,6 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         else               rankFS:SetTextColor(RGB(C.text_dim)) end
         rankFS:SetText(tostring(i))
 
-        -- Player name (.ov-name) + optional (cat)
         local nameFS = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         nameFS:SetSize(COL_NAME, ROW_H)
         nameFS:SetPoint("TOPLEFT", card, "TOPLEFT", COL_RANK + 2, -ry)
@@ -1834,7 +2069,6 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         barBg:SetPoint("TOPLEFT", card, "TOPLEFT",
             COL_RANK + COL_NAME + 2, -ry - (ROW_H - BAR_H) / 2)
 
-        -- Bar fill — flat colors, ElvUI style
         local barPct = math.max(0.01, math.abs(e.dps) / maxAbs)
         local fillW  = math.max(2, math.floor(barPct * dynBarW))
         local barFill = FlatTex(card, "ARTWORK", 1, 1, 1, 0.85)
@@ -1848,7 +2082,6 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
             barFill:SetVertexColor(RGB(C.red))
         end
 
-        -- DPS value
         local dpsFS = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         dpsFS:SetSize(COL_DPS, ROW_H)
         dpsFS:SetPoint("TOPRIGHT", card, "TOPRIGHT", -4, -ry)
@@ -1863,7 +2096,6 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
             dpsFS:SetTextColor(RGB(C.red))
         end
 
-        -- Row separator line — thin gold
         if i < #entries then
             local sep = FlatTex(card, "BACKGROUND", RGB(C.border))
             sep:SetHeight(1)
@@ -1872,18 +2104,24 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         end
     end
 
-    card._cardH = cardH   -- store for ReflowCards reposition
+    card._cardH = cardH
     return card, cardH
 end
-
--- Hide all current card frames (keep parented to cardContent — SetParent(nil)
--- leaks them to UIParent and they accumulate across resizes causing lag/disappearing)
+-- Release all current cards.  Pooled cards return to cardRecyclePool;
+-- fresh detail-view cards are parked in cardGraveyard (not reused, but
+-- removed from cardContent's child list so WoW stops processing them).
 local function ClearCards()
     if not cardContent then return end
     for _, c in ipairs(cardPool) do
-        c:Hide()
+        if c._p then
+            ReleaseCard(c)          -- pooled: return for reuse
+        else
+            c:SetParent(cardGraveyard)  -- fresh detail card: park, don't reuse
+            c:ClearAllPoints()
+            c:Hide()
+        end
     end
-    cardPool = {}
+    cardPool    = {}
     activeCards = 0
     cardContent:SetHeight(1)
 end
@@ -2609,6 +2847,8 @@ function cttLoot_UI:ResetAwardFilter()
 end
 
 function cttLoot_UI:Build()
+    InitCardPool()   -- idempotent; creates cardGraveyard if not already done
+
     -- ── Main window ──
     window = CreateFrame("Frame", "cttLootFrame", UIParent)
 
@@ -2833,34 +3073,43 @@ function cttLoot_UI:Build()
     -- Cards are expensive to create (20+ sub-frames each). Rebuilding them on
     -- every resize causes unbounded frame accumulation in cardContent.
     -- Instead we just reposition existing cards to fit the new width.
-    local resizeTimer = nil
-    window:SetScript("OnSizeChanged", function()
-        if resizeTimer then resizeTimer:Cancel() end
-        resizeTimer = C_Timer.NewTimer(0.2, function()
-            resizeTimer = nil
+    -- ── Resize debounce (OnUpdate, zero allocations) ──────────────────────────
+    -- The old approach called C_Timer.NewTimer on every pixel of resize (~60/s).
+    -- Each NewTimer allocates a Lua object and registers with WoW's timer list,
+    -- which is iterated every frame.  After ~20 seconds of dragging the list
+    -- accumulates ~1,200+ objects and causes the progressive frame-rate drop.
+    --
+    -- This OnUpdate frame costs nothing while hidden.  OnSizeChanged resets the
+    -- elapsed counter and shows the frame; OnUpdate hides itself once the delay
+    -- elapses and fires the reflow — zero timer objects ever created.
+    local resizeElapsed = 0
+    local RESIZE_DELAY  = 0.15
+    local resizeDF = CreateFrame("Frame")
+    resizeDF:Hide()
+    resizeDF:SetScript("OnUpdate", function(_, dt)
+        resizeElapsed = resizeElapsed + dt
+        if resizeElapsed >= RESIZE_DELAY then
+            resizeDF:Hide()
+            resizeElapsed = 0
             if not cardScrollF or not cardContent then return end
-
-            -- Update content frame widths (guard against zero — frame may not have settled)
             local csW = cardScrollF:GetWidth()
             if csW > 10 then cardContent:SetWidth(csW) end
             if historyScrollF and historyContent then
                 local hsW = historyScrollF:GetWidth()
                 if hsW > 10 then historyContent:SetWidth(hsW - 4) end
             end
-
-            -- Relayout filter bars
-            if filterBar and filterBar.Relayout then filterBar.Relayout() end
+            if filterBar        and filterBar.Relayout        then filterBar.Relayout()        end
             if historyFilterBar and historyFilterBar.Relayout then historyFilterBar.Relayout() end
-
-            -- Save new size
-            cttLootDB.windowW = math.floor(window:GetWidth())
-            cttLootDB.windowH = math.floor(window:GetHeight())
-
-            -- Reflow cards to new width WITHOUT recreating them.
-            -- Full Refresh() (which recreates all cards) is only needed when
-            -- data or filters change, not when the window is resized.
+            if cttLootDB then
+                cttLootDB.windowW = math.floor(window:GetWidth())
+                cttLootDB.windowH = math.floor(window:GetHeight())
+            end
             cttLoot_UI:ReflowCards()
-        end)
+        end
+    end)
+    window:SetScript("OnSizeChanged", function()
+        resizeElapsed = 0
+        if not resizeDF:IsShown() then resizeDF:Show() end
     end)
 
     -- ── Drawer (right-side settings panel) ──
