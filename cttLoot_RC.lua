@@ -95,10 +95,16 @@ local function ApplyRCSessionFilter(session)
 end
 
 -- ── Winner annotation ─────────────────────────────────────────────────────────
--- Store awarded winner so PopulateGrid can stamp it onto the card.
-function cttLoot_RC:GetWinner(itemName)
-    if not itemName then return nil end
-    return awardedItems[itemName:lower()]
+-- awardedItems stores a list of winners per item (multiple drops of same item)
+local function AddWinner(itemKey, name)
+    if not awardedItems[itemKey] then
+        awardedItems[itemKey] = {}
+    end
+    -- Only add if not already in list
+    for _, v in ipairs(awardedItems[itemKey]) do
+        if v == name then return end
+    end
+    table.insert(awardedItems[itemKey], name)
 end
 
 local function OnAwardSuccess(_, session, winner, status, link)
@@ -113,19 +119,56 @@ local function OnAwardSuccess(_, session, winner, status, link)
 
     -- Strip realm from winner name
     local shortName = winner:match("^([^%-]+)") or winner
-    awardedItems[matched:lower()] = shortName
+    AddWinner(matched:lower(), shortName)
 
     cttLoot:Print(string.format("|cffffd700%s|r awarded to |cff00ff00%s|r", matched, shortName))
     cttLoot_UI:Refresh()
+
+    -- Broadcast award to all group members with cttLoot
+    local channel = IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or nil)
+    if channel then
+        local msg = "AWARD:" .. matched .. "\t" .. shortName
+        C_ChatInfo.SendAddonMessage(cttLoot.PREFIX, msg, channel)
+    end
 end
 
--- ── Clear awarded items when a new loot session starts ────────────────────────
+-- Handle an incoming award broadcast from the ML
+local function OnAwardReceived(itemName, winner)
+    if not itemName or not winner then return end
+    local matched = MatchItemName(itemName)
+    if not matched then return end
+    AddWinner(matched:lower(), winner)
+    cttLoot_UI:Refresh()
+end
+
+function cttLoot_RC.HandleMessage(message)
+    if message:sub(1, 6) == "AWARD:" then
+        local payload = message:sub(7)
+        local itemName, winner = payload:match("^(.+)\t(.+)$")
+        OnAwardReceived(itemName, winner)
+        return true
+    end
+    return false
+end
+
+-- ── Clear state when a new loot session starts ───────────────────────────────
+-- Note: awardedItems is NOT cleared here — it persists until new parse data is loaded.
 local function OnLootTableReceived()
-    awardedItems = {}
     activeSession = nil
     rcSessionActive = false
     cttLoot_UI.lootFilter   = nil
     cttLoot_UI.selectedItem = nil
+end
+
+-- Called by cttLoot.lua when new parse data is loaded (CSV paste or broadcast receive)
+function cttLoot_RC.ClearAwards()
+    awardedItems = {}
+    if cttLoot_UI and cttLoot_UI.ResetAwardFilter then
+        cttLoot_UI:ResetAwardFilter()
+    end
+    if cttLoot_UI and cttLoot_UI.Refresh then
+        cttLoot_UI:Refresh()
+    end
 end
 
 -- ── Initialise ────────────────────────────────────────────────────────────────
@@ -166,6 +209,7 @@ function cttLoot_RC:Init()
         rcSessionActive = false
         cttLoot_UI.lootFilter   = nil
         cttLoot_UI.selectedItem = nil
+        cttLoot_UI:ReleaseSnap()
         cttLoot_UI:Close()
     end)
 
@@ -197,6 +241,7 @@ function cttLoot_RC:Init()
             activeSession = nil
             cttLoot_UI.lootFilter   = nil
             cttLoot_UI.selectedItem = nil
+            cttLoot_UI:ReleaseSnap()
             cttLoot_UI:Close()
         end)
     end
@@ -246,8 +291,10 @@ function cttLoot_RC:Test(itemName)
 end
 
 -- ── Winner stamp accessor (called from MakeCard in cttLoot_UI.lua) ────────────
--- Returns the winner name string for a given item, or nil.
+-- Returns a comma-joined string of all winners, or nil if none.
 function cttLoot_RC.GetWinnerForItem(itemName)
     if not itemName then return nil end
-    return awardedItems[itemName:lower()]
+    local list = awardedItems[itemName:lower()]
+    if not list or #list == 0 then return nil end
+    return table.concat(list, ", ")
 end

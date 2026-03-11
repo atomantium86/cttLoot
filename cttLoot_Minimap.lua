@@ -41,7 +41,7 @@ local function Build()
     -- Background circle
     local bg = btn:CreateTexture(nil, "BACKGROUND")
     bg:SetTexture(WHITE)
-    bg:SetVertexColor(0.1, 0.1, 0.1, 1)
+    bg:SetVertexColor(0.102, 0.102, 0.102, 1)
     bg:SetAllPoints(btn)
 
     -- Icon — use SetNormalTexture so the Button frame renders it correctly
@@ -59,7 +59,7 @@ local function Build()
     border:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
     border:SetSize(BTN_SIZE + 10, BTN_SIZE + 10)
     border:SetPoint("CENTER", btn, "CENTER", 0, 0)
-    border:SetVertexColor(0.24, 0.49, 0.75, 1)  -- accent blue
+    border:SetVertexColor(0.302, 0.498, 0.667, 1)  -- ElvUI steel blue
 
     -- Highlight
     local hl = btn:CreateTexture(nil, "HIGHLIGHT")

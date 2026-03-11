@@ -7,6 +7,8 @@
 --   Card header click → single-item full view (all players, no row limit)
 
 cttLoot_UI = {}
+cttLoot_UI.awardedOnly  = false
+cttLoot_UI.sortByDelta  = true   -- default on
 
 -- ── Layout constants ──────────────────────────────────────────────────────────
 local WIN_W      = 920
@@ -29,23 +31,25 @@ local DD_ROW_H   = 20        -- dropdown row height
 
 -- ── Colour palette matching HTML :root vars ───────────────────────────────────
 local C = {
-    bg          = {0.090, 0.090, 0.090},  -- #171717
-    bg2         = {0.118, 0.118, 0.118},  -- #1e1e1e
-    bg3         = {0.067, 0.067, 0.067},  -- #111
-    bg_title    = {0.075, 0.075, 0.075},  -- #131313
-    bg_hdr      = {0.102, 0.102, 0.102},  -- #1a1a1a
-    border      = {0.200, 0.200, 0.200},  -- #333
-    accent      = {0.243, 0.490, 0.753},  -- #3E7DC0
-    accent2     = {0.180, 0.369, 0.569},  -- #2e5e91
-    text        = {0.898, 0.898, 0.898},  -- #e5e5e5
-    text_dim    = {0.533, 0.533, 0.533},  -- #888
-    text_hi     = {1.000, 1.000, 1.000},
-    green       = {0.329, 0.682, 0.329},  -- #54ae54
-    red         = {0.780, 0.251, 0.251},  -- #c74040
-    catalyst    = {0.608, 0.349, 0.816},  -- #9b59d0
-    rank_gold   = {0.831, 0.659, 0.263},  -- #d4a843
-    rank_silver = {0.753, 0.753, 0.753},  -- #c0c0c0
-    rank_bronze = {0.722, 0.451, 0.200},  -- #b87333
+    bg          = {0.102, 0.102, 0.102},  -- #1a1a1a  main background
+    bg2         = {0.122, 0.122, 0.122},  -- #1f1f1f  slightly lighter panels
+    bg3         = {0.075, 0.075, 0.075},  -- #131313  darkest inset areas
+    bg_title    = {0.082, 0.082, 0.082},  -- #151515  titlebar
+    bg_hdr      = {0.114, 0.114, 0.114},  -- #1d1d1d  section headers
+    border      = {0.165, 0.165, 0.165},  -- #2a2a2a  thin border everywhere
+    accent      = {0.302, 0.498, 0.667},  -- #4d7faa  ElvUI steel blue
+    accent2     = {0.220, 0.365, 0.490},  -- #385d7d  darker blue hover
+    text        = {0.878, 0.878, 0.878},  -- #e0e0e0  primary text
+    text_dim    = {0.431, 0.431, 0.431},  -- #6e6e6e  dimmed text
+    text_hi     = {1.000, 1.000, 1.000},  -- #ffffff  highlight text
+    green       = {0.337, 0.659, 0.337},  -- #56a856  positive delta
+    red         = {0.749, 0.255, 0.255},  -- #bf4141  negative delta
+    catalyst    = {0.545, 0.306, 0.737},  -- #8b4ebc  catalyst purple
+    rank_gold   = {0.800, 0.647, 0.251},  -- #cca540
+    rank_silver = {0.714, 0.714, 0.714},  -- #b6b6b6
+    rank_bronze = {0.694, 0.431, 0.192},  -- #b16e31
+    card_bg     = {0.102, 0.102, 0.102},  -- same as bg
+    card_hdr    = {0.082, 0.082, 0.082},  -- slightly darker card header
 }
 
 local WHITE = "Interface\\Buttons\\WHITE8X8"
@@ -56,6 +60,8 @@ local drawer        = nil
 local drawerOpen    = false
 local cardScrollF   = nil    -- ScrollFrame for card grid
 local filterBar     = nil    -- Filter bar (for relayout after stats update)
+local awardedFilterBtn = nil -- Awarded-only toggle button
+local sortFilterBtn    = nil -- Sort-by-delta toggle button
 local cardContent   = nil    -- content frame inside scroll
 local cardPool      = {}     -- reuse frames: cardPool[i] = frame
 local activeCards   = 0
@@ -289,9 +295,9 @@ local function MakeDrawerSection(parent, title, yOff)
         cttLoot_UI:RepositionDrawer()
     end)
 
-    hdr:SetScript("OnEnter", function() hdr._bg:SetVertexColor(0.14, 0.14, 0.14) end)
+    hdr:SetScript("OnEnter", function() hdr._bg:SetVertexColor(0.157, 0.157, 0.157) end)
     hdr:SetScript("OnLeave", function() hdr._bg:SetVertexColor(RGB(C.bg_hdr)) end)
-    hdr._bg = Bg(hdr, C.bg_hdr)   -- re-assign so hover works; ok to overwrite
+    hdr._bg = Bg(hdr, C.bg_hdr)
 
     table.insert(drawerSections, sec)
     return sec
@@ -707,11 +713,7 @@ local function IsCatalyst(name)
 end
 
 local function CatColFor(name)
-    local cat = name .. " CATALYST"
-    for i, n in ipairs(cttLoot.itemNames) do
-        if n == cat then return i end
-    end
-    return nil
+    return cttLoot.itemIndex[name .. " CATALYST"]
 end
 
 local function GetItemPool()
@@ -728,26 +730,59 @@ local function GetItemPool()
     end
 
     local selectedPlayer = cttLoot_UI.selectedPlayer
+    local playerRow = selectedPlayer and cttLoot.matrix[cttLoot.playerIndex[selectedPlayer]]
     for _, n in ipairs(source) do
         if not IsCatalyst(n) then
-            if selectedPlayer then
-                -- Only include items where this player has a value
-                local ci = nil
-                for i, name in ipairs(cttLoot.itemNames) do
-                    if name == n then ci = i; break end
-                end
-                local playerRow = nil
-                for r, p in ipairs(cttLoot.playerNames) do
-                    if p == selectedPlayer then playerRow = cttLoot.matrix[r]; break end
-                end
-                if ci and playerRow and playerRow[ci] then
+            local passesAward = not cttLoot_UI.awardedOnly
+                or (cttLoot_RC and cttLoot_RC.GetWinnerForItem(n))
+            if passesAward then
+                if selectedPlayer then
+                    local ci = cttLoot.itemIndex[n]
+                    if ci and playerRow and playerRow[ci] then
+                        table.insert(pool, n)
+                    end
+                else
                     table.insert(pool, n)
                 end
-            else
-                table.insert(pool, n)
             end
         end
     end
+    return pool
+end
+
+-- Helper: get the best delta for an item across all players, or for a specific player
+local function GetItemDelta(itemName, forPlayer)
+    local ci = cttLoot.itemIndex[itemName]
+    if not ci then return 0 end
+    local best = 0
+    if forPlayer then
+        local pi = cttLoot.playerIndex[forPlayer]
+        local v = pi and cttLoot.matrix[pi] and cttLoot.matrix[pi][ci]
+        return v or 0
+    end
+    for r = 1, #cttLoot.playerNames do
+        local v = cttLoot.matrix[r] and cttLoot.matrix[r][ci]
+        if v and v > best then best = v end
+    end
+    return best
+end
+
+local function GetItemPoolSorted()
+    local pool = GetItemPool()
+    if cttLoot_UI.selectedItem then return pool end
+    if not cttLoot_UI.sortByDelta then
+        table.sort(pool)
+        return pool
+    end
+    -- Pre-cache delta for each item to avoid O(N*players) work per sort comparison
+    local forPlayer = cttLoot_UI.selectedPlayer
+    local deltaCache = {}
+    for _, name in ipairs(pool) do
+        deltaCache[name] = GetItemDelta(name, forPlayer)
+    end
+    table.sort(pool, function(a, b)
+        return deltaCache[a] > deltaCache[b]
+    end)
     return pool
 end
 
@@ -758,23 +793,24 @@ local playerBestItem = {}
 -- Returns the card frame (or nil) and its total height.
 local function MakeCard(itemName, ox, oy, limit, cardW)
     cardW = cardW or CARD_W
-    -- Find column index
-    local ci = nil
-    for i, n in ipairs(cttLoot.itemNames) do
-        if n == itemName then ci = i; break end
-    end
+    local ci = cttLoot.itemIndex[itemName]
     if not ci then return nil, 0 end
 
     local catCi = CatColFor(itemName)
 
     -- Gather entries
     local entries = {}
+    local filterPlayer = cttLoot_UI.selectedPlayer
     for r, player in ipairs(cttLoot.playerNames) do
-        local row = cttLoot.matrix[r]
-        local base = row and row[ci]
-        local cat  = catCi and row and row[catCi]
-        if base then table.insert(entries, { player=player, dps=base, isCat=false }) end
-        if cat  then table.insert(entries, { player=player, dps=cat,  isCat=true  }) end
+        if not filterPlayer or player == filterPlayer then
+            local row = cttLoot.matrix[r]
+            local base = row and row[ci]
+            local cat  = catCi and row and row[catCi]
+            -- In overview (no item zoom), hide negative deltas
+            local showNeg = cttLoot_UI.selectedItem ~= nil
+            if base and (showNeg or base >= 0) then table.insert(entries, { player=player, dps=base, isCat=false }) end
+            if cat  and (showNeg or cat  >= 0) then table.insert(entries, { player=player, dps=cat,  isCat=true  }) end
+        end
     end
     table.sort(entries, function(a,b) return a.dps > b.dps end)
 
@@ -790,58 +826,78 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
     -- Card layout
     local info     = cttLoot:GetItemInfo(itemName)
     local hasBoss  = info and info.boss
-    local hdrH     = hasBoss and 32 or 20  -- two-line header if boss known
+    local winner   = cttLoot_RC and cttLoot_RC.GetWinnerForItem(itemName)
+    -- hdrH: 1 line (item only) = 20, 2 lines (item+boss) = 32, 3 lines (item+boss+winner) = 44
+    local hdrH = 20
+    if hasBoss  then hdrH = 32 end
+    if hasBoss and winner then hdrH = 44 end
     local cardH    = hdrH + #entries * ROW_H + 2
 
     local card = CreateFrame("Frame", nil, cardContent)
     card:SetSize(cardW, cardH)
     card:SetPoint("TOPLEFT", cardContent, "TOPLEFT", ox, -oy)
 
-    Bg(card, C.bg2)
+    Bg(card, C.card_bg)
     PixelBorder(card, C.border)
 
     -- Header button (clicking zooms to single-item view)
     local hdr = CreateFrame("Button", nil, card)
     hdr:SetHeight(hdrH)
     hdr:SetPoint("TOPLEFT"); hdr:SetPoint("TOPRIGHT")
-    local hdrBg = Bg(hdr, C.bg3)
+    local hdrBg = Bg(hdr, C.card_hdr)
 
     -- Item name (.ov-title)
     local titleFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    titleFS:SetPoint("TOPLEFT", hdr, "TOPLEFT", 6, -5)
-    titleFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -5)
+    titleFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -4)
+    titleFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -4)
+    titleFS:SetHeight(12)
     titleFS:SetTextColor(RGB(C.text_hi))
     titleFS:SetText(itemName)
     titleFS:SetJustifyH("LEFT")
     titleFS:SetWordWrap(false)
+    titleFS:SetNonSpaceWrap(false)
 
-    -- Boss sub-label (.ov-boss — accent blue, smaller)
+    -- Boss sub-label
     if hasBoss then
         local bossFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        bossFS:SetPoint("BOTTOMLEFT", hdr, "BOTTOMLEFT", 6, 4)
+        bossFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -17)
+        bossFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -17)
+        bossFS:SetHeight(12)
         bossFS:SetTextColor(RGB(C.accent))
         bossFS:SetText(info.boss)
         bossFS:SetJustifyH("LEFT")
+        bossFS:SetWordWrap(false)
+        bossFS:SetNonSpaceWrap(false)
     end
 
     -- Winner stamp — shown when RC has awarded this item
-    local winner = cttLoot_RC and cttLoot_RC.GetWinnerForItem(itemName)
     if winner then
         local winnerFS = hdr:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        winnerFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -6, -5)
-        winnerFS:SetTextColor(0.2, 1, 0.2, 1)  -- green
+        if hasBoss then
+            winnerFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -29)
+            winnerFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -29)
+            winnerFS:SetJustifyH("LEFT")
+        else
+            winnerFS:SetPoint("TOPLEFT",  hdr, "TOPLEFT",  6, -4)
+            winnerFS:SetPoint("TOPRIGHT", hdr, "TOPRIGHT", -4, -4)
+            winnerFS:SetJustifyH("RIGHT")
+        end
+        winnerFS:SetHeight(12)
+        winnerFS:SetWordWrap(false)
+        winnerFS:SetNonSpaceWrap(false)
+        winnerFS:SetTextColor(0.2, 1, 0.2, 1)
         winnerFS:SetText(">> " .. winner)
-        winnerFS:SetJustifyH("RIGHT")
 
-        -- Dim the entire card to signal it's been awarded
-        local dimTex = card:CreateTexture(nil, "OVERLAY")
-        dimTex:SetAllPoints(card)
-        dimTex:SetColorTexture(0, 0, 0, 0.5)
+        -- Dim the entire card only in overview grid (not when zoomed into single-item view)
+        if not cttLoot_UI.selectedItem then
+            local dimTex = card:CreateTexture(nil, "OVERLAY")
+            dimTex:SetAllPoints(card)
+            dimTex:SetColorTexture(0, 0, 0, 0.5)
+        end
     end
 
     hdr:SetScript("OnEnter", function() hdrBg:SetVertexColor(RGB(C.accent2)) end)
-    hdr:SetScript("OnLeave", function() hdrBg:SetVertexColor(RGB(C.bg3))    end)
-    hdr:SetScript("OnClick", function()
+    hdr:SetScript("OnLeave", function() hdrBg:SetVertexColor(RGB(C.card_hdr)) end)    hdr:SetScript("OnClick", function()
         CloseDropdowns()
         if cttLoot_UI.selectedItem == itemName then
             -- clicking same item header → go back to previous view
@@ -866,12 +922,12 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         -- Gold highlight if this is the player's best item
         local isBest = not e.isCat and (playerBestItem[e.player] == itemName)
         if isBest then
-            local bestBg = FlatTex(card, "BACKGROUND", 1, 0.82, 0.1, 0.12)
+            local ar, ag, ab = RGB(C.accent)
+            local bestBg = FlatTex(card, "BACKGROUND", ar, ag, ab, 0.15)
             bestBg:SetSize(cardW, ROW_H)
             bestBg:SetPoint("TOPLEFT", card, "TOPLEFT", 0, -ry)
         elseif i % 2 == 0 then
-            -- Alternating row tint (matching tbody tr:nth-child(even))
-            local rowBg = FlatTex(card, "BACKGROUND", 1, 1, 1, 0.025)
+            local rowBg = FlatTex(card, "BACKGROUND", 1, 1, 1, 0.03)
             rowBg:SetSize(cardW, ROW_H)
             rowBg:SetPoint("TOPLEFT", card, "TOPLEFT", 0, -ry)
         end
@@ -903,14 +959,13 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
             nameFS:SetText(e.player)
         end
 
-        -- Bar background (.ov-bar-wrap)
         local dynBarW = cardW - COL_RANK - COL_NAME - COL_DPS - 10
         local barBg = FlatTex(card, "BACKGROUND", 1, 1, 1, 0.06)
         barBg:SetSize(dynBarW, BAR_H)
         barBg:SetPoint("TOPLEFT", card, "TOPLEFT",
             COL_RANK + COL_NAME + 2, -ry - (ROW_H - BAR_H) / 2)
 
-        -- Bar fill (.ov-bar)
+        -- Bar fill — flat colors, ElvUI style
         local barPct = math.max(0.01, math.abs(e.dps) / maxAbs)
         local fillW  = math.max(2, math.floor(barPct * dynBarW))
         local barFill = FlatTex(card, "ARTWORK", 1, 1, 1, 0.85)
@@ -924,7 +979,7 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
             barFill:SetVertexColor(RGB(C.red))
         end
 
-        -- DPS value (.ov-dps)
+        -- DPS value
         local dpsFS = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         dpsFS:SetSize(COL_DPS, ROW_H)
         dpsFS:SetPoint("TOPRIGHT", card, "TOPRIGHT", -4, -ry)
@@ -939,9 +994,9 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
             dpsFS:SetTextColor(RGB(C.red))
         end
 
-        -- Row separator line
+        -- Row separator line — thin gold
         if i < #entries then
-            local sep = FlatTex(card, "BACKGROUND", RGB(C.bg_hdr))
+            local sep = FlatTex(card, "BACKGROUND", RGB(C.border))
             sep:SetHeight(1)
             sep:SetPoint("BOTTOMLEFT",  card, "TOPLEFT",  0, -(ry + ROW_H - 1))
             sep:SetPoint("BOTTOMRIGHT", card, "TOPRIGHT", 0, -(ry + ROW_H - 1))
@@ -990,9 +1045,8 @@ end
 local function PopulateGrid()
     if not cardContent then return end
     ClearCards()
-    BuildPlayerBestItems()
 
-    local pool = GetItemPool()
+    local pool = GetItemPoolSorted()
 
     if #pool == 0 then
         if not emptyLabel then
@@ -1499,6 +1553,8 @@ function cttLoot_UI:Toggle()
 end
 
 -- Open the window (build if needed). Does nothing if already visible.
+function cttLoot_UI:GetWindow() return window end
+
 function cttLoot_UI:Open()
     if not window then self:Build() end
     if not window:IsShown() then
@@ -1522,9 +1578,9 @@ function cttLoot_UI:SnapToRC()
     if not rcFrame or not rcFrame:IsShown() then return end
     window:ClearAllPoints()
     window:SetPoint("TOPLEFT", rcFrame, "TOPRIGHT", 2, -3)
+    window:SetMovable(false)
 end
 
--- Release the snap anchor and allow free movement again
 function cttLoot_UI:ReleaseSnap()
     if not window then return end
     local left = window:GetLeft()
@@ -1532,6 +1588,20 @@ function cttLoot_UI:ReleaseSnap()
     window:ClearAllPoints()
     window:SetPoint("TOPLEFT", UIParent, "TOPLEFT", left, top - UIParent:GetHeight())
     window:SetMovable(true)
+    -- Persist released position so it survives a reload
+    if cttLootDB then
+        cttLootDB.windowPoint    = "TOPLEFT"
+        cttLootDB.windowRelPoint = "TOPLEFT"
+        cttLootDB.windowX = left
+        cttLootDB.windowY = top - UIParent:GetHeight()
+    end
+end
+
+function cttLoot_UI:ResetAwardFilter()
+    self.awardedOnly = false
+    if awardedFilterBtn then
+        awardedFilterBtn._label:SetTextColor(RGB(C.text_dim))
+    end
 end
 
 function cttLoot_UI:Build()
@@ -1573,7 +1643,9 @@ function cttLoot_UI:Build()
     window:SetResizeBounds(500, 380, 1600, 1100)
     window:EnableMouse(true)
     window:RegisterForDrag("LeftButton")
-    window:SetScript("OnDragStart", window.StartMoving)
+    window:SetScript("OnDragStart", function()
+        if window:IsMovable() then window:StartMoving() end
+    end)
     window:SetScript("OnDragStop", function()
         window:StopMovingOrSizing()
         local point, _, relPoint, x, y = window:GetPoint(1)
@@ -1586,14 +1658,14 @@ function cttLoot_UI:Build()
     Bg(window, C.bg)
     PixelBorder(window, C.border)
 
-    -- Title bar
+    -- Title bar — flat dark ElvUI style
     local titleBar = CreateFrame("Frame", nil, window)
     titleBar:SetHeight(TITLE_H)
     titleBar:SetPoint("TOPLEFT",  window, "TOPLEFT",  1, -1)
     titleBar:SetPoint("TOPRIGHT", window, "TOPRIGHT", -1, -1)
     Bg(titleBar, C.bg_title)
 
-    -- Blue accent underline under titlebar (matching HTML titlebar border-bottom)
+    -- Thin accent underline under titlebar
     local accentLine = FlatTex(window, "ARTWORK", RGB(C.accent))
     accentLine:SetHeight(1)
     accentLine:SetPoint("TOPLEFT",  titleBar, "BOTTOMLEFT",  0, 0)
@@ -1628,6 +1700,68 @@ function cttLoot_UI:Build()
         cttLoot:RunCheck()
     end)
 
+    -- Awarded filter button (left of Check)
+    awardedFilterBtn = Btn(window, "Awarded", 60, 18)
+    awardedFilterBtn:SetPoint("RIGHT", checkBtn, "LEFT", -2, 0)
+    awardedFilterBtn._label:SetTextColor(RGB(C.text_dim))
+    awardedFilterBtn:SetScript("OnClick", function()
+        cttLoot_UI.awardedOnly = not cttLoot_UI.awardedOnly
+        if cttLoot_UI.awardedOnly then
+            awardedFilterBtn._label:SetTextColor(RGB(C.green))
+        else
+            awardedFilterBtn._label:SetTextColor(RGB(C.text_dim))
+        end
+        cttLoot_UI:Refresh()
+    end)
+    -- Override OnLeave/OnMouseUp to restore active-aware color instead of default
+    awardedFilterBtn:SetScript("OnLeave", function()
+        awardedFilterBtn._bg:SetVertexColor(RGB(C.bg3))
+        if cttLoot_UI.awardedOnly then
+            awardedFilterBtn._label:SetTextColor(RGB(C.green))
+        else
+            awardedFilterBtn._label:SetTextColor(RGB(C.text_dim))
+        end
+    end)
+    awardedFilterBtn:SetScript("OnMouseUp", function()
+        awardedFilterBtn._bg:SetVertexColor(RGB(C.bg3))
+        if cttLoot_UI.awardedOnly then
+            awardedFilterBtn._label:SetTextColor(RGB(C.green))
+        else
+            awardedFilterBtn._label:SetTextColor(RGB(C.text_dim))
+        end
+    end)
+    cttLoot_UI.awardedFilterBtn = awardedFilterBtn
+
+    -- Sort button (left of Awarded) — on by default (delta), off = alphabetical
+    sortFilterBtn = Btn(window, "Delta", 45, 18)
+    sortFilterBtn:SetPoint("RIGHT", awardedFilterBtn, "LEFT", -2, 0)
+    sortFilterBtn._label:SetTextColor(RGB(C.green))  -- on by default
+    sortFilterBtn:SetScript("OnClick", function()
+        cttLoot_UI.sortByDelta = not cttLoot_UI.sortByDelta
+        if cttLoot_UI.sortByDelta then
+            sortFilterBtn._label:SetTextColor(RGB(C.green))
+        else
+            sortFilterBtn._label:SetTextColor(RGB(C.text_dim))
+        end
+        cttLoot_UI:Refresh()
+    end)
+    sortFilterBtn:SetScript("OnLeave", function()
+        sortFilterBtn._bg:SetVertexColor(RGB(C.bg3))
+        if cttLoot_UI.sortByDelta then
+            sortFilterBtn._label:SetTextColor(RGB(C.green))
+        else
+            sortFilterBtn._label:SetTextColor(RGB(C.text_dim))
+        end
+    end)
+    sortFilterBtn:SetScript("OnMouseUp", function()
+        sortFilterBtn._bg:SetVertexColor(RGB(C.bg3))
+        if cttLoot_UI.sortByDelta then
+            sortFilterBtn._label:SetTextColor(RGB(C.green))
+        else
+            sortFilterBtn._label:SetTextColor(RGB(C.text_dim))
+        end
+    end)
+
     -- Resize grip
     local grip = CreateFrame("Button", nil, window)
     grip:SetSize(16, 16)
@@ -1636,14 +1770,17 @@ function cttLoot_UI:Build()
     gripTex:SetAllPoints(grip)
     gripTex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
     grip:SetScript("OnMouseDown", function()
-        window:SetMovable(true)
+        window:SetMovable(true)  -- temporarily allow sizing even if snapped
         window:StartSizing("BOTTOMRIGHT")
     end)
     grip:SetScript("OnMouseUp", function()
         window:StopMovingOrSizing()
+        -- Restore snap lock if RC integration is active
         if cttLoot_RC:IsEnabled() then
+            window:SetMovable(false)
             cttLoot_UI:SnapToRC()
         else
+            window:SetMovable(true)
             local point, _, relPoint, x, y = window:GetPoint(1)
             if point then
                 cttLootDB.windowPoint    = point
@@ -1695,9 +1832,13 @@ initFrame:SetScript("OnEvent", function()
     local ok, err = pcall(function() cttLoot_UI:Build() end)
     if not ok then
         cttLoot:Print("|cffff4444cttLoot UI build error: " .. tostring(err) .. "|r")
-        -- Hide the partially built window so it doesn't appear visible
         if _G["cttLootFrame"] then _G["cttLootFrame"]:Hide() end
         return
     end
+    -- Rebuild playerBestItem whenever parse data changes, not on every grid render
+    cttLoot.onDataApplied = function()
+        BuildPlayerBestItems()
+    end
+    BuildPlayerBestItems()
     cttLoot_UI:Refresh()
 end)

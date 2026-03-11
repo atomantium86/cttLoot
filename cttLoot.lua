@@ -23,6 +23,8 @@ cttLoot.CHUNK_SIZE = 240
 cttLoot.itemNames   = {}
 cttLoot.playerNames = {}
 cttLoot.matrix      = {}
+cttLoot.itemIndex   = {}
+cttLoot.playerIndex = {}
 
 -- ── Saved vars default ────────────────────────────────────────────────────────
 local defaults = { customDB = {}, lastData = nil, windowX = nil, windowY = nil, windowW = nil, windowH = nil, windowPoint = nil, windowRelPoint = nil }
@@ -118,7 +120,9 @@ function cttLoot:ParseCSV(raw)
     local rawPlayerNames, rawPlayerIdxs = {}, {}
     for i = 2, #headerCells do
         if headerCells[i] ~= "" then
-            rawPlayerNames[#rawPlayerNames + 1] = headerCells[i]
+            local name = headerCells[i]
+            name = name:sub(1,1):upper() .. name:sub(2)
+            rawPlayerNames[#rawPlayerNames + 1] = name
             rawPlayerIdxs[#rawPlayerIdxs + 1] = i
         end
     end
@@ -145,8 +149,23 @@ end
 
 function cttLoot:ApplyData(data)
     self.itemNames   = data.itemNames
+    -- Ensure all player names have first letter capitalized regardless of source
+    for i, name in ipairs(data.playerNames) do
+        data.playerNames[i] = name:sub(1,1):upper() .. name:sub(2)
+    end
     self.playerNames = data.playerNames
     self.matrix      = data.matrix
+    -- Build reverse lookup tables for O(1) name->index access
+    self.itemIndex   = {}
+    self.playerIndex = {}
+    for i, v in ipairs(self.itemNames)   do self.itemIndex[v]   = i end
+    for i, v in ipairs(self.playerNames) do self.playerIndex[v] = i end
+    -- Notify listeners that data has changed
+    if self.onDataApplied then self.onDataApplied() end
+    -- Clear awarded stamps — they belong to the previous parse session
+    if cttLoot_RC and cttLoot_RC.ClearAwards then
+        cttLoot_RC.ClearAwards()
+    end
 end
 
 -- ── Serialisation ─────────────────────────────────────────────────────────────
@@ -180,6 +199,7 @@ local function Deserialize(raw)
             local sep  = rest:find("|")
             if sep then
                 local player = rest:sub(1, sep - 1)
+                player = player:sub(1,1):upper() .. player:sub(2)
                 local valStr = rest:sub(sep + 1)
                 data.playerNames[#data.playerNames + 1] = player
                 local row = {}
@@ -296,28 +316,71 @@ function cttLoot:BroadcastDB(channel)
 end
 
 -- ── Checksum ──────────────────────────────────────────────────────────────────
-local checkResults = {}  -- { [name] = "match" | "mismatch" }
-local checkTimer   = nil
+local checkResults   = {}  -- { [name] = { parse, db } }
+local checkTimer     = nil
+
+-- FNV-1a 32-bit hash over a string (Lua 5.1 compatible — no bitwise operators)
+local function FNV1a(str)
+    local hash = 2166136261
+    for i = 1, #str do
+        local b = str:byte(i)
+        -- XOR via: a ~ b = (a + b) - 2*(a & b), but simpler: use the bit library if available,
+        -- otherwise approximate with addition-based mixing that still distributes well
+        if bit then
+            hash = bit.bxor(hash, b)
+        else
+            -- Manual XOR for environments without bit lib
+            local xor, mask, h, bv = 0, 1, hash, b
+            while h > 0 or bv > 0 do
+                local hb, bb = h % 2, bv % 2
+                if hb ~= bb then xor = xor + mask end
+                mask, h, bv = mask * 2, math.floor(h / 2), math.floor(bv / 2)
+            end
+            hash = xor
+        end
+        hash = (hash * 16777619) % 4294967296
+    end
+    return hash
+end
 
 local function Checksum()
     if #cttLoot.itemNames == 0 then return "empty" end
-    local sum = 0
-    for r = 1, #cttLoot.matrix do
-        for i = 1, #cttLoot.itemNames do
-            local v = cttLoot.matrix[r][i]
-            if v then sum = sum + v * (r * 100 + i) end
+    -- Sorted copies for deterministic iteration
+    local items   = {}; for _, v in ipairs(cttLoot.itemNames)   do items[#items+1]   = v end
+    local players = {}; for _, v in ipairs(cttLoot.playerNames) do players[#players+1] = v end
+    table.sort(items)
+    table.sort(players)
+    -- Serialize all values in deterministic order using persistent index tables
+    local parts = {}
+    for _, pname in ipairs(players) do
+        local pi = cttLoot.playerIndex[pname]
+        for _, iname in ipairs(items) do
+            local ii = cttLoot.itemIndex[iname]
+            local v = cttLoot.matrix[pi] and cttLoot.matrix[pi][ii]
+            if v then
+                parts[#parts+1] = iname .. "\t" .. pname .. "\t" .. string.format("%.4f", v)
+            end
         end
     end
-    return string.format("%d|%d|%d", #cttLoot.itemNames, #cttLoot.playerNames, sum % 1000000)
+    local payload = table.concat(parts, "\n")
+    return string.format("%d|%d|%08x", #cttLoot.itemNames, #cttLoot.playerNames, FNV1a(payload))
+end
+
+local function DBChecksum()
+    local keys = {}
+    for key in pairs(cttLoot.DB) do keys[#keys+1] = tostring(key) end
+    table.sort(keys)
+    local payload = table.concat(keys, ",")
+    return string.format("%d|%08x", #keys, FNV1a(payload))
 end
 
 -- ── Network: receive ──────────────────────────────────────────────────────────
 -- Midnight: addon message payloads are Secret in instances.
 -- We guard with InChatMessagingLockdown() and discard rather than read Secrets.
-local inboundBuffers   = {}
-local inboundDBBuffers = {}
+local inboundBuffers        = {}
+local inboundDBBuffers      = {}
 
-local function OnAddonMessage(_, prefix, message, _, sender)
+local function OnAddonMessage(_, prefix, message, channel, sender)
     if prefix ~= cttLoot.PREFIX then return end
 
     -- Do not attempt to read Secret message contents in instances.
@@ -327,21 +390,40 @@ local function OnAddonMessage(_, prefix, message, _, sender)
     local senderShort = sender:match("^([^%-]+)") or sender
     if not cttLoot.loopback and senderShort == UnitName("player") then return end
 
-    -- Checksum ping — someone is asking for our checksum
+    -- Checksum ping — someone is asking for our checksums
     if message == "CHECK:" then
-        local myCheck = Checksum()
+        local reply = Checksum() .. "|DB:" .. DBChecksum()
         local channel = IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or "WHISPER")
         local target  = channel == "WHISPER" and sender or nil
-        SafeSendAddonMessage(cttLoot.PREFIX, "CHECKR:" .. myCheck, channel, target)
+        SafeSendAddonMessage(cttLoot.PREFIX, "CHECKR:" .. reply, channel, target)
+        return
+    end
+
+    -- RC award broadcast from ML — stamp winner on card for all clients
+    if message:sub(1, 6) == "AWARD:" then
+        if cttLoot_RC and cttLoot_RC.HandleMessage then
+            cttLoot_RC.HandleMessage(message)
+        end
         return
     end
 
     -- Checksum response — someone replied to our check
     if message:sub(1, 7) == "CHECKR:" then
-        local theirCheck = message:sub(8)
-        local myCheck    = Checksum()
+        local payload     = message:sub(8)
+        local myCheck     = Checksum()
+        local myDBCheck   = DBChecksum()
+        -- Format: "parseCheck|DB:dbCheck"
+        local theirParse, theirDB = payload:match("^(.+)|DB:(.+)$")
+        if not theirParse then
+            -- Legacy client — no DB checksum
+            theirParse = payload
+            theirDB    = nil
+        end
         if checkResults then
-            checkResults[sender] = (theirCheck == myCheck) and "match" or "mismatch"
+            checkResults[sender] = {
+                parse = (theirParse == myCheck),
+                db    = theirDB and (theirDB == myDBCheck) or nil,
+            }
         end
         return
     end
@@ -364,6 +446,9 @@ local function OnAddonMessage(_, prefix, message, _, sender)
             inboundDBBuffers[sender] = nil
             local entries = DeserializeDB(fullPayload)
             local cnt = 0
+            -- Full replace — sender's DB becomes ours
+            cttLoot.DB = {}
+            cttLootDB.customDB = {}
             for id, entry in pairs(entries) do
                 cttLoot.DB[id] = entry
                 cttLootDB.customDB[id] = entry
@@ -371,7 +456,7 @@ local function OnAddonMessage(_, prefix, message, _, sender)
             end
             cttLoot:MergeCustomDB()
             cttLoot_UI:PopulateBossDropdown()
-            cttLoot:Print(string.format("Received item DB from %s: %d entries added.", sender, cnt))
+            cttLoot:Print(string.format("Received item DB from %s: replaced with %d entries.", sender, cnt))
         end
         return
     end
@@ -639,8 +724,9 @@ function cttLoot:RunCheck()
         if #cttLoot.itemNames == 0 then
             cttLoot:Print("No data loaded — nothing to check.")
         else
-            local myCheck = Checksum()
-            cttLoot:Print(string.format("My checksum: %s — pinging group...", myCheck))
+            local myCheck   = Checksum()
+            local myDBCheck = DBChecksum()
+            cttLoot:Print(string.format("Parse: %s  DB: %s — pinging group...", myCheck, myDBCheck))
             checkResults = {}
             if checkTimer then checkTimer:Cancel(); checkTimer = nil end
             local channel = IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or "WHISPER")
@@ -653,17 +739,25 @@ function cttLoot:RunCheck()
                     return
                 end
                 for name, result in pairs(checkResults) do
-                    if result == "match" then
-                        cttLoot:Print(string.format("  %s |cff44ff44[OK]|r match", name))
+                    local parseOK = result.parse
+                    local dbOK    = result.db
+                    local parseStr = parseOK and "|cff44ff44parse OK|r" or "|cffff4444parse mismatch|r"
+                    local dbStr
+                    if dbOK == nil then
+                        dbStr = "|cffaaaaaaDB unknown (old client)|r"
+                    elseif dbOK then
+                        dbStr = "|cff44ff44DB OK|r"
                     else
-                        cttLoot:Print(string.format("  %s |cffff4444[!!]|r mismatch", name))
+                        dbStr = "|cffff4444DB mismatch|r"
                     end
+                    cttLoot:Print(string.format("  %s — %s  %s", name, parseStr, dbStr))
                 end
             end)
         end
 end
 
--- ── EJ-based RC test ──────────────────────────────────────────────────────────
+
+
 -- /cttloot ejtest [N]
 --   Reads boss loot directly from the Encounter Journal for Liberation of
 --   Undermine (instance 1296), picks a random boss (or boss #N), then adds
@@ -791,7 +885,7 @@ local function SlashHandler(msg)
         cttLoot:Print("  |cffffd700/cttloot lootdebug|r — print loot slot debug info")
         cttLoot:Print("  |cffffd700/cttloot unknown|r — list unmatched CSV items")
         cttLoot:Print("  |cffffd700/cttloot reset|r — reset window position/size")
-        cttLoot:Print("  |cffffd700/cttloot rcdebug|r — dump RC master looter methods")
+        cttLoot:Print("  |cffffd700/cttloot awardtest <item> [>> winner]|r — simulate award broadcast")
     elseif msg == "check" then
         cttLoot:RunCheck()
     elseif msg:sub(1, 6) == "rctest" then
@@ -841,7 +935,26 @@ local function SlashHandler(msg)
         else
             cttLoot:Print(string.format("DATA LOSS: lost %d values!", nonNilBefore - nonNilAfter))
         end
-    elseif msg == "test" then
+    elseif msg:sub(1, 9) == "awardtest" then
+        -- Usage: /cttloot awardtest <item name> [winner]
+        -- Simulates receiving an award broadcast without needing RC or a group
+        local arg = msg:sub(11):match("^%s*(.-)%s*$")
+        local itemPart, winnerPart = arg:match("^(.+)%s+>>%s+(.+)$")
+        if not itemPart then
+            itemPart   = arg
+            winnerPart = UnitName("player") or "TestPlayer"
+        end
+        if itemPart == "" then
+            cttLoot:Print("Usage: /cttloot awardtest <item> [>> winner]")
+        elseif cttLoot_RC and cttLoot_RC.HandleMessage then
+            local fakeMsg = "AWARD:" .. itemPart .. "\t" .. winnerPart
+            local handled = cttLoot_RC.HandleMessage(fakeMsg)
+            if handled then
+                cttLoot:Print(string.format("Award test: |cffffd700%s|r → |cff00ff00%s|r", itemPart, winnerPart))
+            else
+                cttLoot:Print(string.format("Award test: no match for '%s'", itemPart))
+            end
+        end
         cttLoot.testMode = not cttLoot.testMode
         cttLoot.testBossIndex = 1
         if cttLoot.testMode then
@@ -929,11 +1042,13 @@ end
 local frame = CreateFrame("Frame")
 frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_LOGIN")
+frame:RegisterEvent("PLAYER_LOGOUT")
 frame:RegisterEvent("CHAT_MSG_ADDON")
 frame:RegisterEvent("ENCOUNTER_END")
 frame:RegisterEvent("LOOT_OPENED")
 frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 frame:RegisterEvent("PLAYER_REGEN_DISABLED")
+
 frame:SetScript("OnEvent", function(_, event, ...)
     if event == "ADDON_LOADED" then
         local name = ...
@@ -953,6 +1068,20 @@ frame:SetScript("OnEvent", function(_, event, ...)
     elseif event == "PLAYER_LOGIN" then
         -- Delay RC init slightly to ensure RCLootCouncil has fully loaded
         C_Timer.After(1, function() cttLoot_RC:Init() end)
+    elseif event == "PLAYER_LOGOUT" then
+        -- Flush current window position to DB before saving
+        if cttLoot_UI and cttLootDB then
+            local w = cttLoot_UI:GetWindow()
+            if w and w:IsShown() then
+                local point, _, relPoint, x, y = w:GetPoint(1)
+                if point then
+                    cttLootDB.windowPoint    = point
+                    cttLootDB.windowRelPoint = relPoint
+                    cttLootDB.windowX = x
+                    cttLootDB.windowY = y
+                end
+            end
+        end
     elseif event == "CHAT_MSG_ADDON" then
         OnAddonMessage(_, ...)
     elseif event == "ENCOUNTER_END" then
