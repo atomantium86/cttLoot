@@ -1794,15 +1794,14 @@ function cttLoot_UI:Build()
     -- Reflow scroll frame and save size whenever window size changes
     local resizeTimer = nil
     window:SetScript("OnSizeChanged", function()
-        if not cardScrollF or not cardContent then return end
-        cardScrollF:SetPoint("BOTTOMRIGHT", window, "BOTTOMRIGHT", -22, PAD + 14)
-        cardContent:SetWidth(cardScrollF:GetWidth())
-        cttLootDB.windowW = math.floor(window:GetWidth())
-        cttLootDB.windowH = math.floor(window:GetHeight())
-        -- Debounce the expensive Refresh call
         if resizeTimer then resizeTimer:Cancel() end
         resizeTimer = C_Timer.NewTimer(0.15, function()
             resizeTimer = nil
+            if not cardScrollF or not cardContent then return end
+            cardScrollF:SetPoint("BOTTOMRIGHT", window, "BOTTOMRIGHT", -22, PAD + 14)
+            cardContent:SetWidth(cardScrollF:GetWidth())
+            cttLootDB.windowW = math.floor(window:GetWidth())
+            cttLootDB.windowH = math.floor(window:GetHeight())
             cttLoot_UI:Refresh()
         end)
     end)
