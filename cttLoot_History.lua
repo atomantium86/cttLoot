@@ -15,10 +15,14 @@
 
 cttLoot_History = {}
 
+-- Cached reversed view — invalidated on any mutation
+local getAllCache = nil
+
 -- ── Public: record one award ──────────────────────────────────────────────────
 -- Called by cttLoot_RC immediately after an award is confirmed.
 -- Snapshots the current matrix so values are frozen at decision time.
 function cttLoot_History:RecordAward(itemName, winner)
+    getAllCache = nil
     if not cttLootDB then return end
     if not cttLootDB.history then cttLootDB.history = {} end
 
@@ -52,6 +56,7 @@ end
 
 -- ── Public: prune entries older than N days ───────────────────────────────────
 function cttLoot_History:PruneOlderThan(days)
+    getAllCache = nil
     if not cttLootDB or not cttLootDB.history then return 0 end
     local cutoff = time() - (days * 86400)
     local kept   = {}
@@ -69,12 +74,14 @@ end
 
 -- ── Public: get all entries (newest first) ────────────────────────────────────
 function cttLoot_History:GetAll()
+    if getAllCache then return getAllCache end
     if not cttLootDB or not cttLootDB.history then return {} end
     -- Return a reversed copy so newest is first
     local result = {}
     for i = #cttLootDB.history, 1, -1 do
         table.insert(result, cttLootDB.history[i])
     end
+    getAllCache = result
     return result
 end
 
@@ -86,6 +93,7 @@ end
 
 -- ── Public: clear all ────────────────────────────────────────────────────────
 function cttLoot_History:ClearAll()
+    getAllCache = nil
     if cttLootDB then cttLootDB.history = {} end
 end
 

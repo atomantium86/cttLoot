@@ -2,8 +2,10 @@
 ## Title: cttLoot
 ## Notes: Paste SimC/raidbots CSV data and broadcast DPS deltas to your raid
 ## Author: cttLoot
-## Version: 1.0.0
+## Version: v1.0.0
 ## SavedVariables: cttLootDB
+
+libs\LibDeflate.lua
 
 cttLoot.lua
 cttLoot_DB.lua

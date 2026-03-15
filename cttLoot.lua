@@ -22,12 +22,42 @@ cttLoot.loopback   = false
 cttLoot.PREFIX     = "cttLoot"
 cttLoot.CHUNK_SIZE = 240
 
+-- ── LibDeflate compression (bundled in libs/LibDeflate.lua)
+local LibDeflate
+if _G.LibStub then
+    local ok, lib = pcall(_G.LibStub.GetLibrary, _G.LibStub, "LibDeflate")
+    if ok and lib then LibDeflate = lib end
+end
+if not LibDeflate then LibDeflate = _G.LibDeflate end  -- fallback to global
+
+local function CompressPayload(raw)
+    if not LibDeflate then return raw, false end
+    local compressed = LibDeflate:CompressDeflate(raw, {level = 5})
+    if not compressed then return raw, false end
+    local encoded = LibDeflate:EncodeForWoWAddonChannel(compressed)
+    if not encoded then return raw, false end
+    return encoded, true
+end
+
+local function DecompressPayload(encoded)
+    if not LibDeflate then return nil end
+    local compressed = LibDeflate:DecodeForWoWAddonChannel(encoded)
+    if not compressed then return nil end
+    return LibDeflate:DecompressDeflate(compressed)
+end
+
 -- Data model
 cttLoot.itemNames   = {}
 cttLoot.playerNames = {}
 cttLoot.matrix      = {}
 cttLoot.itemIndex   = {}   -- name -> index  (O(1))
 cttLoot.playerIndex = {}   -- name -> index  (O(1))
+
+-- Derived caches (rebuilt by ApplyData; safe to read as empty tables before load)
+cttLoot.itemIndexLower = {}   -- lowercase name → original name
+cttLoot.catalystSet    = {}   -- catalyst item name → true
+cttLoot.catColIndex    = {}   -- item name → catalyst column index
+cttLoot.itemNamesLower = {}   -- parallel array of lowered item names
 
 -- ── Saved vars defaults ───────────────────────────────────────────────────────
 local defaults = {
@@ -126,6 +156,30 @@ function cttLoot:ApplyData(data, resetAwards)
     self.playerIndex = {}
     for i, v in ipairs(self.itemNames)   do self.itemIndex[v]   = i end
     for i, v in ipairs(self.playerNames) do self.playerIndex[v] = i end
+
+    -- ── Derived caches (only change when data is imported) ──
+    -- lowercase item name → original name  (O(1) lookups in MatchItemName, OpenLootUI, etc.)
+    self.itemIndexLower = {}
+    for _, v in ipairs(self.itemNames) do self.itemIndexLower[v:lower()] = v end
+
+    -- set of catalyst item names (avoids upper()+sub() per IsCatalyst call)
+    self.catalystSet = {}
+    for _, name in ipairs(self.itemNames) do
+        if name:upper():sub(-9) == " CATALYST" then self.catalystSet[name] = true end
+    end
+
+    -- item name → catalyst column index (avoids string concat per CatColFor call)
+    self.catColIndex = {}
+    for _, name in ipairs(self.itemNames) do
+        if not self.catalystSet[name] then
+            self.catColIndex[name] = self.itemIndex[name .. " CATALYST"]
+        end
+    end
+
+    -- pre-lowered item names for substring matching (avoids per-element lower())
+    self.itemNamesLower = {}
+    for i, v in ipairs(self.itemNames) do self.itemNamesLower[i] = v:lower() end
+
     if self.onDataApplied then self.onDataApplied() end
     if resetAwards and cttLoot_RC and cttLoot_RC.ClearAwards then cttLoot_RC.ClearAwards() end
 end
@@ -175,8 +229,12 @@ local function SafeSend(prefix, msg, channel, target)
         cttLoot:Print("Cannot send: addon messaging restricted in instances.")
         return false
     end
-    C_ChatInfo.SendAddonMessage(prefix, msg, channel, target)
-    return true
+    local ok = C_ChatInfo.SendAddonMessage(prefix, msg, channel, target)
+    if not ok then
+        cttLoot:Print(string.format("|cffff4444SendAddonMessage failed|r (channel=%s, %d bytes). Are you in a group?",
+            tostring(channel), #msg))
+    end
+    return ok
 end
 
 local function BroadcastChunked(payload, msgPrefix, channel, target, onDone)
@@ -185,10 +243,52 @@ local function BroadcastChunked(payload, msgPrefix, channel, target, onDone)
         chunks[#chunks+1]=payload:sub(pos, pos+cttLoot.CHUNK_SIZE-1)
         pos=pos+cttLoot.CHUNK_SIZE
     end
-    local total, i, ticker = #chunks, 1
-    ticker = C_Timer.NewTicker(0.1, function()
-        if i>total then ticker:Cancel(); if onDone then onDone(total) end; return end
-        SafeSend(cttLoot.PREFIX, msgPrefix..i.."/"..total..":"..chunks[i], channel, target)
+    -- WoW's per-prefix throttle (Patch 4.4.0+): 10-message burst bucket,
+    -- refills at 1 message/second.  We send the first 10 instantly (burst),
+    -- then 1 per second to stay within the sustained allowance.
+    -- This matches how MRT/AceComm/ChatThrottleLib handle bulk data.
+    local BURST = 10
+    local total = #chunks
+    local i = 1
+    local failures = 0
+
+    -- Phase 1: send burst immediately
+    while i <= total and i <= BURST do
+        local ok = SafeSend(cttLoot.PREFIX, msgPrefix..i.."/"..total..":"..chunks[i], channel, target)
+        if not ok then failures=failures+1 end
+        i=i+1
+    end
+    if total <= BURST then
+        cttLoot:Print(string.format("  Burst sent %d/%d", total, total))
+    else
+        cttLoot:Print(string.format("  Burst sent %d/%d, sustaining 1/sec...", BURST, total))
+    end
+
+    -- Phase 2: send remaining at 1/sec
+    if i > total then
+        if failures>0 then
+            cttLoot:Print(string.format("|cffff4444%d/%d chunks failed to send!|r",failures,total))
+        end
+        if onDone then onDone(total) end
+        return
+    end
+
+    local ticker
+    ticker = C_Timer.NewTicker(1.0, function()
+        if i>total then
+            ticker:Cancel()
+            if failures>0 then
+                cttLoot:Print(string.format("|cffff4444%d/%d chunks failed to send! Is everyone in the same group?|r",failures,total))
+            end
+            if onDone then onDone(total) end
+            return
+        end
+        local ok = SafeSend(cttLoot.PREFIX, msgPrefix..i.."/"..total..":"..chunks[i], channel, target)
+        if not ok then failures=failures+1 end
+        -- Progress feedback every 20 chunks
+        if i%20==0 then
+            cttLoot:Print(string.format("  Sending %d/%d...", i, total))
+        end
         i=i+1
     end)
 end
@@ -198,21 +298,37 @@ function cttLoot:Broadcast(channel)
         channel = IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or "WHISPER")
     end
     local target  = channel=="WHISPER" and UnitName("player") or nil
-    local payload = Serialize({itemNames=self.itemNames,playerNames=self.playerNames,matrix=self.matrix})
-    cttLoot:Print(string.format("Serialized payload: %d bytes, %d chunks",
-        #payload, math.ceil(#payload/self.CHUNK_SIZE)))
-    BroadcastChunked(payload, "", channel, target, function(total)
-        cttLoot:Print(string.format("Broadcast %d items x %d players to %s in %d chunk(s).",
+    local raw = Serialize({itemNames=self.itemNames,playerNames=self.playerNames,matrix=self.matrix})
+    local payload, compressed = CompressPayload(raw)
+    local prefix = compressed and "C" or ""
+    local numChunks = math.ceil(#payload/self.CHUNK_SIZE)
+    if compressed then
+        cttLoot:Print(string.format("Sending %d bytes → %d compressed (%d%% ratio, %d chunks) on %s — ETA %ds...",
+            #raw, #payload, math.floor(#payload/#raw*100), numChunks, channel, math.max(1, numChunks - 10)))
+    else
+        cttLoot:Print(string.format("Sending %d bytes (%d chunks) on %s — ETA %ds...%s",
+            #raw, numChunks, channel, math.max(1, numChunks - 10),
+            not LibDeflate and "  |cffff8800LibDeflate failed to load — compression disabled.|r" or ""))
+    end
+    if channel=="WHISPER" then
+        cttLoot:Print("|cffff8800Warning: not in a group — sending to self only.|r")
+    end
+    BroadcastChunked(payload, prefix, channel, target, function(total)
+        cttLoot:Print(string.format("Broadcast %d items x %d players to %s in %d chunk(s). Done.",
             #cttLoot.itemNames, #cttLoot.playerNames, channel, total))
     end)
 end
 
 -- ── DB serialisation ──────────────────────────────────────────────────────────
 local function SerializeDB()
-    local lines = {"DBVER|1"}
-    for id, entry in pairs(cttLoot.DB) do
+    local lines = {"DBVER|2"}
+    for key, entry in pairs(cttLoot.DB) do
         if entry.name and entry.boss then
-            lines[#lines+1]="DBENTRY|"..id.."|"..entry.name.."|"..entry.boss
+            local numId = tostring(key):match("^(%d+)")
+            if numId then
+                local eid = entry.encounterId and tostring(entry.encounterId) or ""
+                lines[#lines+1]="DBENTRY|"..numId.."|"..entry.name.."|"..entry.boss.."|"..eid
+            end
         end
     end
     return table.concat(lines, SEP)
@@ -223,9 +339,14 @@ local function DeserializeDB(raw)
     for line in (raw..SEP):gmatch("([^"..SEP.."]*)("..SEP..")") do
         if line:sub(1,8)=="DBENTRY|" then
             local rest=line:sub(9)
-            local id,name,boss=rest:match("^(%d+)|([^|]+)|(.+)$")
+            local id,name,boss,eid=rest:match("^(%d+)|([^|]+)|([^|]+)|?(.*)$")
             id=tonumber(id)
-            if id and name and boss then entries[id]={name=name,boss=boss} end
+            if id and name and boss then
+                -- Reconstruct compound key matching ParseDBRaw format
+                local key = tostring(id) .. "_" .. name
+                local encounterId = tonumber(eid)
+                entries[key]={name=name, boss=boss, encounterId=encounterId}
+            end
         end
     end
     return entries
@@ -238,9 +359,23 @@ function cttLoot:BroadcastDB(channel)
     local target=channel=="WHISPER" and UnitName("player") or nil
     local count=0; for _ in pairs(self.DB) do count=count+1 end
     if count==0 then self:Print("Item DB is empty."); return end
-    local payload=SerializeDB()
-    BroadcastChunked(payload, "DB:", channel, target, function(total)
-        cttLoot:Print(string.format("Sent item DB (%d entries) to %s in %d chunk(s).",count,channel,total))
+    local raw=SerializeDB()
+    local payload, compressed = CompressPayload(raw)
+    local prefix = compressed and "DBC:" or "DB:"
+    local numChunks = math.ceil(#payload/self.CHUNK_SIZE)
+    if compressed then
+        cttLoot:Print(string.format("Sending DB (%d entries, %d→%d bytes, %d chunks) on %s — ETA %ds...",
+            count, #raw, #payload, numChunks, channel, math.max(1, numChunks - 10)))
+    else
+        cttLoot:Print(string.format("Sending DB (%d entries, %d bytes, %d chunks) on %s — ETA %ds...%s",
+            count, #raw, numChunks, channel, math.max(1, numChunks - 10),
+            not LibDeflate and "  |cffff8800LibDeflate failed to load — compression disabled.|r" or ""))
+    end
+    if channel=="WHISPER" then
+        cttLoot:Print("|cffff8800Warning: not in a group — sending to self only.|r")
+    end
+    BroadcastChunked(payload, prefix, channel, target, function(total)
+        cttLoot:Print(string.format("Sent item DB (%d entries) to %s in %d chunk(s). Done.",count,channel,total))
     end)
 end
 
@@ -294,6 +429,12 @@ local checkResults     = {}
 local checkTimer       = nil
 local inboundBuffers   = {}
 local inboundDBBuffers = {}
+-- Timeout timers: if chunk assembly doesn't complete within the expected
+-- transfer window, warn the user and clear the stale buffer.  Without
+-- this, a single dropped chunk causes the receiver to hang silently forever.
+local inboundTimeouts   = {}   -- sender → timer
+local inboundDBTimeouts = {}   -- sender → timer
+local RECEIVE_TIMEOUT   = 150  -- seconds; 125 chunks at 1/sec sustained = ~115s, 150s gives safe margin
 
 local function OnAddonMessage(_, prefix, message, channel, sender)
     if prefix~=cttLoot.PREFIX then return end
@@ -329,17 +470,88 @@ local function OnAddonMessage(_, prefix, message, channel, sender)
         return
     end
 
-    -- DB chunks
+    -- Compressed DB chunks (DBC: prefix — must be checked before DB:)
+    if message:sub(1,4)=="DBC:" then
+        local idx,total,data=message:match("^DBC:(%d+)/(%d+):(.*)$")
+        idx=tonumber(idx); total=tonumber(total)
+        if not idx or not total then return end
+        if not inboundDBBuffers[sender] or inboundDBBuffers[sender].total~=total then
+            inboundDBBuffers[sender]={total=total,received=0,chunks={},compressed=true}
+            cttLoot:Print(string.format("Receiving compressed DB from %s: 0/%d chunks...",senderShort,total))
+        end
+        local buf=inboundDBBuffers[sender]
+        if not buf.chunks[idx] then buf.received=buf.received+1 end
+        buf.chunks[idx]=data
+        if buf.received%10==0 and buf.received<total then
+            cttLoot:Print(string.format("  Receiving DB: %d/%d...",buf.received,total))
+        end
+        if inboundDBTimeouts[sender] then inboundDBTimeouts[sender]:Cancel() end
+        local senderSnap=sender
+        inboundDBTimeouts[sender]=C_Timer.NewTimer(RECEIVE_TIMEOUT, function()
+            inboundDBTimeouts[senderSnap]=nil
+            local stale=inboundDBBuffers[senderSnap]
+            if stale then
+                cttLoot:Print(string.format("|cffff4444DB sync from %s timed out: received %d/%d chunks. "
+                    .."Ask them to resend.|r",senderSnap,stale.received,stale.total))
+                inboundDBBuffers[senderSnap]=nil
+            end
+        end)
+        if buf.received>=total then
+            if inboundDBTimeouts[sender] then inboundDBTimeouts[sender]:Cancel(); inboundDBTimeouts[sender]=nil end
+            local encoded=table.concat(buf.chunks)
+            inboundDBBuffers[sender]=nil
+            local raw = DecompressPayload(encoded)
+            if not raw then
+                cttLoot:Print(string.format("|cffff4444Failed to decompress DB from %s. LibDeflate may not have loaded correctly.|r",sender))
+                return
+            end
+            local entries=DeserializeDB(raw)
+            local cnt=0
+            cttLoot.DB={}; cttLootDB.customDB={}
+            for id,entry in pairs(entries) do
+                cttLoot.DB[id]=entry; cttLootDB.customDB[id]=entry; cnt=cnt+1
+            end
+            cttLoot:MergeCustomDB()
+            if cttLoot_UI and cttLoot_UI.PopulateBossDropdown then
+                cttLoot_UI:PopulateBossDropdown()
+            end
+            cttLoot:Print(string.format("Received compressed DB from %s: %d→%d bytes, %d entries.",
+                sender,#encoded,#raw,cnt))
+        end
+        return
+    end
+
+    -- DB chunks (uncompressed)
     if message:sub(1,3)=="DB:" then
         local idx,total,data=message:match("^DB:(%d+)/(%d+):(.*)$")
         idx=tonumber(idx); total=tonumber(total)
         if not idx or not total then return end
         if not inboundDBBuffers[sender] or inboundDBBuffers[sender].total~=total then
             inboundDBBuffers[sender]={total=total,received=0,chunks={}}
+            cttLoot:Print(string.format("Receiving item DB from %s: 0/%d chunks...",senderShort,total))
         end
         local buf=inboundDBBuffers[sender]
-        buf.chunks[idx]=data; buf.received=buf.received+1
-        if buf.received==total then
+        -- Only count genuinely new chunks (guards against duplicates)
+        if not buf.chunks[idx] then buf.received=buf.received+1 end
+        buf.chunks[idx]=data
+        -- Progress feedback every 10 unique chunks
+        if buf.received%10==0 and buf.received<total then
+            cttLoot:Print(string.format("  Receiving DB: %d/%d...",buf.received,total))
+        end
+        -- Start/reset timeout on first or subsequent chunk
+        if inboundDBTimeouts[sender] then inboundDBTimeouts[sender]:Cancel() end
+        local senderSnap=sender
+        inboundDBTimeouts[sender]=C_Timer.NewTimer(RECEIVE_TIMEOUT, function()
+            inboundDBTimeouts[senderSnap]=nil
+            local stale=inboundDBBuffers[senderSnap]
+            if stale then
+                cttLoot:Print(string.format("|cffff4444DB sync from %s timed out: received %d/%d chunks. "
+                    .."Ask them to resend.|r",senderSnap,stale.received,stale.total))
+                inboundDBBuffers[senderSnap]=nil
+            end
+        end)
+        if buf.received>=total then
+            if inboundDBTimeouts[sender] then inboundDBTimeouts[sender]:Cancel(); inboundDBTimeouts[sender]=nil end
             local entries=DeserializeDB(table.concat(buf.chunks))
             inboundDBBuffers[sender]=nil
             local cnt=0
@@ -356,16 +568,89 @@ local function OnAddonMessage(_, prefix, message, channel, sender)
         return
     end
 
-    -- Parse data chunks
+    -- Compressed parse data chunks (C prefix)
+    local cidx,ctotal,cdata=message:match("^C(%d+)/(%d+):(.*)$")
+    if cidx and ctotal then
+        cidx=tonumber(cidx); ctotal=tonumber(ctotal)
+        if not inboundBuffers[sender] or inboundBuffers[sender].total~=ctotal then
+            inboundBuffers[sender]={total=ctotal,received=0,chunks={},compressed=true}
+            cttLoot:Print(string.format("Receiving compressed parse data from %s: 0/%d chunks...",senderShort,ctotal))
+        end
+        local buf=inboundBuffers[sender]
+        if not buf.chunks[cidx] then buf.received=buf.received+1 end
+        buf.chunks[cidx]=cdata
+        if buf.received%10==0 and buf.received<ctotal then
+            cttLoot:Print(string.format("  Receiving parse: %d/%d...",buf.received,ctotal))
+        end
+        if inboundTimeouts[sender] then inboundTimeouts[sender]:Cancel() end
+        local senderSnap=sender
+        inboundTimeouts[sender]=C_Timer.NewTimer(RECEIVE_TIMEOUT, function()
+            inboundTimeouts[senderSnap]=nil
+            local stale=inboundBuffers[senderSnap]
+            if stale then
+                cttLoot:Print(string.format("|cffff4444Parse sync from %s timed out: received %d/%d chunks. "
+                    .."Ask them to resend.|r",senderSnap,stale.received,stale.total))
+                inboundBuffers[senderSnap]=nil
+            end
+        end)
+        if buf.received>=ctotal then
+            if inboundTimeouts[sender] then inboundTimeouts[sender]:Cancel(); inboundTimeouts[sender]=nil end
+            local encoded=table.concat(buf.chunks)
+            inboundBuffers[sender]=nil
+            local raw = DecompressPayload(encoded)
+            if not raw then
+                cttLoot:Print(string.format("|cffff4444Failed to decompress parse data from %s. LibDeflate may not have loaded correctly.|r",sender))
+                return
+            end
+            local parsed=Deserialize(raw)
+            local nonNil=0
+            for r=1,#parsed.matrix do
+                for i=1,#parsed.itemNames do
+                    if parsed.matrix[r][i]~=nil then nonNil=nonNil+1 end
+                end
+            end
+            cttLoot:Print(string.format("Received compressed data from %s: %d→%d bytes, %d items x %d players, %d values",
+                sender,#encoded,#raw,#parsed.itemNames,#parsed.playerNames,nonNil))
+            cttLoot:ApplyData(parsed, true)
+            if cttLoot_UI then
+                cttLoot_UI:SetBossFilter(nil)
+                cttLoot_UI:SetLootFilter(nil)
+                cttLoot_UI:Refresh()
+            end
+        end
+        return
+    end
+
+    -- Parse data chunks (uncompressed)
     local idx,total,data=message:match("^(%d+)/(%d+):(.*)$")
     idx=tonumber(idx); total=tonumber(total)
     if not idx or not total then return end
     if not inboundBuffers[sender] or inboundBuffers[sender].total~=total then
         inboundBuffers[sender]={total=total,received=0,chunks={}}
+        cttLoot:Print(string.format("Receiving parse data from %s: 0/%d chunks...",senderShort,total))
     end
     local buf=inboundBuffers[sender]
-    buf.chunks[idx]=data; buf.received=buf.received+1
-    if buf.received==total then
+    -- Only count genuinely new chunks (guards against duplicates)
+    if not buf.chunks[idx] then buf.received=buf.received+1 end
+    buf.chunks[idx]=data
+    -- Progress feedback every 10 unique chunks
+    if buf.received%10==0 and buf.received<total then
+        cttLoot:Print(string.format("  Receiving parse: %d/%d...",buf.received,total))
+    end
+    -- Start/reset timeout on first or subsequent chunk
+    if inboundTimeouts[sender] then inboundTimeouts[sender]:Cancel() end
+    local senderSnap=sender
+    inboundTimeouts[sender]=C_Timer.NewTimer(RECEIVE_TIMEOUT, function()
+        inboundTimeouts[senderSnap]=nil
+        local stale=inboundBuffers[senderSnap]
+        if stale then
+            cttLoot:Print(string.format("|cffff4444Parse sync from %s timed out: received %d/%d chunks. "
+                .."Ask them to resend.|r",senderSnap,stale.received,stale.total))
+            inboundBuffers[senderSnap]=nil
+        end
+    end)
+    if buf.received>=total then
+        if inboundTimeouts[sender] then inboundTimeouts[sender]:Cancel(); inboundTimeouts[sender]=nil end
         local assembled={}
         for i=1,total do assembled[i]=buf.chunks[i] or "" end
         inboundBuffers[sender]=nil
@@ -401,8 +686,7 @@ local function RunTestLoot()
     local bossName=bosses[cttLoot.testBossIndex]
     cttLoot.testBossIndex=cttLoot.testBossIndex+1
 
-    local csvNameSet={}
-    for _,csvName in ipairs(cttLoot.itemNames) do csvNameSet[csvName:lower()]=csvName end
+    local csvNameSet=cttLoot.itemIndexLower
     local pool={}
     for _,itemName in ipairs(cttLoot:GetItemsForBoss(bossName)) do
         local nameLower=itemName:lower()
@@ -438,22 +722,24 @@ end
 local function ResolveBoss()
     local encounterId=cttLoot.lastKilledEncounterId
     local killedName=cttLoot.lastKilledName
+
+    -- Pass 1: O(1) encounter ID lookup
     if encounterId then
-        for _,entry in pairs(cttLoot.DB) do
-            if entry.encounterId==encounterId then return entry.boss end
-        end
+        local boss = cttLoot.DBByEncounterId[encounterId]
+        if boss then return boss end
     end
+
     if killedName then
         local killedLower=killedName:lower()
-        for _,entry in pairs(cttLoot.DB) do
-            if entry.boss and entry.boss:lower()==killedLower then return entry.boss end
-        end
-        for _,entry in pairs(cttLoot.DB) do
-            if entry.boss then
-                local bossLower=entry.boss:lower()
-                if bossLower:find(killedLower,1,true) or killedLower:find(bossLower,1,true) then
-                    return entry.boss
-                end
+
+        -- Pass 2: O(1) exact boss name lookup
+        local boss = cttLoot.DBByBossLower[killedLower]
+        if boss then return boss end
+
+        -- Pass 3: substring match (rare fallback, uses pre-lowered keys)
+        for bossLower, bossCanonical in pairs(cttLoot.DBByBossLower) do
+            if bossLower:find(killedLower,1,true) or killedLower:find(bossLower,1,true) then
+                return bossCanonical
             end
         end
     end
@@ -462,10 +748,9 @@ end
 
 local function OpenLootUI(matchedBoss)
     if not cttLoot_UI then return end
-    local csvNameSet={}
-    for _,csvName in ipairs(cttLoot.itemNames) do csvNameSet[csvName:lower()]=csvName end
-    local lootedNames={}
     local numSlots=GetNumLootItems and GetNumLootItems() or 0
+    local csvNameSet=cttLoot.itemIndexLower
+    local lootedNames={}
     for i=1,numSlots do
         local name=GetLootSlotInfo and select(2,GetLootSlotInfo(i))
         if name and name~="" then
@@ -731,8 +1016,7 @@ local function SlashHandler(msg)
         if #cttLoot.itemNames==0 then cttLoot:Print("No CSV data loaded."); return end
         local unknown={}
         for _,name in ipairs(cttLoot.itemNames) do
-            local isCat=name:upper():sub(-9)==" CATALYST"
-            if not isCat and not cttLoot:GetItemInfo(name) then unknown[#unknown+1]=name end
+            if not cttLoot.catalystSet[name] and not cttLoot:GetItemInfo(name) then unknown[#unknown+1]=name end
         end
         if #unknown==0 then cttLoot:Print("All items matched in DB.")
         else
@@ -772,7 +1056,10 @@ frame:SetScript("OnEvent", function(_, event, ...)
             cttLoot:MergeCustomDB()
             if cttLoot_History then cttLoot_History:Init() end
             C_ChatInfo.RegisterAddonMessagePrefix(cttLoot.PREFIX)
-            cttLoot:Print("Loaded. Type /cttloot for commands.")
+            local deflateStatus = LibDeflate
+                and "|cff44ff44LibDeflate: enabled|r"
+                or  "|cffff4444LibDeflate: failed to load! Compression disabled.|r"
+            cttLoot:Print("Loaded. "..deflateStatus.." — /cttloot for commands.")
         end
     elseif event=="PLAYER_LOGIN" then
         C_Timer.After(1,function() cttLoot_RC:Init() end)

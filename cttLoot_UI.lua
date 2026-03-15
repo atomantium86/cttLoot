@@ -272,7 +272,9 @@ local function BuildClassColors()
         local _, classToken = UnitClass("player")
         if classToken and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classToken] then
             local c = RAID_CLASS_COLORS[classToken]
-            classColorCache[selfName:lower()] = { c.r, c.g, c.b }
+            local color = { c.r, c.g, c.b }
+            classColorCache[selfName] = color
+            classColorCache[selfName:lower()] = color
         end
     end
     -- Scan group members
@@ -286,7 +288,9 @@ local function BuildClassColors()
             local _, classToken = UnitClass(unit)
             if classToken and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classToken] then
                 local c = RAID_CLASS_COLORS[classToken]
-                classColorCache[name:lower()] = { c.r, c.g, c.b }
+                local color = { c.r, c.g, c.b }
+                classColorCache[name] = color
+                classColorCache[name:lower()] = color
             end
         end
     end
@@ -322,9 +326,11 @@ function cttLoot_UI.MarkAwardsDirty()
     awardsDirty = true
 end
 
+-- Fast path: try original-case name first (avoids lower()+match() in common case).
+-- Player names from cttLoot.playerNames always match group names in casing.
 local function GetClassColor(playerName)
-    local key = playerName:lower():match("^([^%-]+)") or playerName:lower()
-    return classColorCache[key]
+    return classColorCache[playerName]
+        or classColorCache[playerName:lower():match("^([^%-]+)") or playerName:lower()]
 end
 
 
@@ -1624,11 +1630,11 @@ end
 
 -- ── Card rendering ────────────────────────────────────────────────────────────
 local function IsCatalyst(name)
-    return name:upper():sub(-9) == " CATALYST"
+    return cttLoot.catalystSet[name] or false
 end
 
 local function CatColFor(name)
-    return cttLoot.itemIndex[name .. " CATALYST"]
+    return cttLoot.catColIndex[name]
 end
 
 local function GetItemPool()
@@ -1951,6 +1957,25 @@ local function ConfigureCard(card, itemName, entries, maxAbs, ox, oy, cardW, hdr
     end
 end
 
+-- ── Reusable entry buffer for MakeCard (avoids per-card table allocations) ───
+-- Cards are built sequentially, never concurrently, so a single shared buffer
+-- is safe.  Sub-tables are reused by overwriting fields; excess slots are nilled
+-- so ipairs/#entries still work correctly.
+local entryBuf = {}
+
+local function ResetEntryBuf(n)
+    -- nil out any slots beyond n so # and ipairs see the correct length
+    for i = n + 1, #entryBuf do entryBuf[i] = nil end
+end
+
+local function AddEntry(count, player, dps, isCat)
+    count = count + 1
+    local e = entryBuf[count]
+    if not e then e = {}; entryBuf[count] = e end
+    e.player = player; e.dps = dps; e.isCat = isCat
+    return count
+end
+
 -- Build or reconfigure a card for `itemName` at (ox, oy) in cardContent.
 -- Overview (limit > 0): acquires a pooled card and configures it in-place —
 --   zero frame allocations after the pool is warm.
@@ -1963,8 +1988,8 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
 
     local catCi = CatColFor(itemName)
 
-    -- Gather entries
-    local entries = {}
+    -- Gather entries into reusable buffer
+    local n = 0
     local filterPlayer = cttLoot_UI.selectedPlayer
     for r, player in ipairs(cttLoot.playerNames) do
         if not filterPlayer or player == filterPlayer then
@@ -1972,18 +1997,20 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
             local base = row and row[ci]
             local cat  = catCi and row and row[catCi]
             local showNeg = cttLoot_UI.selectedItem ~= nil
-            if base and (showNeg or base >= 0) then table.insert(entries, { player=player, dps=base, isCat=false }) end
-            if cat  and (showNeg or cat  >= 0) then table.insert(entries, { player=player, dps=cat,  isCat=true  }) end
+            if base and (showNeg or base >= 0) then n = AddEntry(n, player, base, false) end
+            if cat  and (showNeg or cat  >= 0) then n = AddEntry(n, player, cat, true) end
         end
     end
-    table.sort(entries, function(a,b) return a.dps > b.dps end)
+    ResetEntryBuf(n)
+    table.sort(entryBuf, function(a,b) return a.dps > b.dps end)
 
-    if limit and limit > 0 then
-        while #entries > limit do table.remove(entries) end
+    if limit and limit > 0 and n > limit then
+        ResetEntryBuf(limit)
+        n = limit
     end
 
     local maxAbs = 1
-    for _, e in ipairs(entries) do
+    for _, e in ipairs(entryBuf) do
         if math.abs(e.dps) > maxAbs then maxAbs = math.abs(e.dps) end
     end
 
@@ -1993,12 +2020,12 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
     local hdrH = 20
     if hasBoss        then hdrH = 32 end
     if hasBoss and winner then hdrH = 44 end
-    local cardH = hdrH + #entries * ROW_H + 2
+    local cardH = hdrH + #entryBuf * ROW_H + 2
 
     -- ── Overview: zero-allocation pooled card ─────────────────────────────────
     if limit and limit > 0 then
         local card = AcquireCard()
-        ConfigureCard(card, itemName, entries, maxAbs, ox, oy, cardW, hdrH, cardH, info, winner)
+        ConfigureCard(card, itemName, entryBuf, maxAbs, ox, oy, cardW, hdrH, cardH, info, winner)
         return card, cardH
     end
 
@@ -2071,7 +2098,7 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         cttLoot_UI:Refresh()
     end)
 
-    for i, e in ipairs(entries) do
+    for i, e in ipairs(entryBuf) do
         local ry = hdrH + (i-1) * ROW_H
 
         local isBest = not e.isCat and (playerBestItem[e.player] == itemName)
@@ -2162,7 +2189,7 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
             else               dpsFS:SetTextColor(RGB(C.red)) end
         end
 
-        if i < #entries then
+        if i < #entryBuf then
             local sep = FlatTex(card, "BACKGROUND", RGB(C.border))
             sep:SetHeight(1)
             sep:SetPoint("BOTTOMLEFT",  card, "TOPLEFT",  0, -(ry + ROW_H - 1))
@@ -2580,6 +2607,7 @@ local itemDdAllRows  = {}
 
 -- ── Boss dropdown population ──────────────────────────────────────────────────
 function cttLoot_UI:PopulateBossDropdown()
+    visibleItemsCache = {}   -- DB may have changed; drop cached per-boss item lists
     if not bossDdFrame then return end
 
     -- Build search + list on first call
@@ -2815,7 +2843,11 @@ function cttLoot_UI:SetSelectedItem(name)
     end
 end
 
+-- Cached per-boss visible item lists.  Invalidated on data/DB import.
+local visibleItemsCache = {}
+
 function cttLoot_UI:GetVisibleItemsForBoss(bossName)
+    if visibleItemsCache[bossName] then return visibleItemsCache[bossName] end
     local dbItems = cttLoot:GetItemsForBoss(bossName)
     if #dbItems == 0 then
         -- Boss not in DB at all — show everything
@@ -2826,13 +2858,14 @@ function cttLoot_UI:GetVisibleItemsForBoss(bossName)
         bossSet[item:lower()] = true
     end
     local result = {}
-    for _, n in ipairs(cttLoot.itemNames) do
-        local info = cttLoot:GetItemInfo(n)
+    local itemLower = cttLoot.itemNamesLower
+    for i, n in ipairs(cttLoot.itemNames) do
         -- Include if: matches this boss in DB, OR not in DB at all
-        if bossSet[n:lower()] or not info then
+        if bossSet[itemLower[i]] or not cttLoot:GetItemInfo(n) then
             table.insert(result, n)
         end
     end
+    visibleItemsCache[bossName] = result
     return result
 end
 
@@ -3323,6 +3356,7 @@ initFrame:SetScript("OnEvent", function(_, event)
     cttLoot.onDataApplied = function()
         BuildPlayerBestItems()
         awardsDirty = true
+        visibleItemsCache = {}
     end
     BuildPlayerBestItems()
     -- classColorsDirty and awardsDirty are already true from declaration;

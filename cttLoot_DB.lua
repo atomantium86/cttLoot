@@ -5,10 +5,12 @@
 cttLoot.DB = {}
 
 -- ── Derived lookups (built at load time, do not edit) ─────────────────────────
-cttLoot.DBByName   = {}  -- lowercase item name → { boss }
-cttLoot.DBByBoss   = {}  -- boss name           → { itemName, ... }
-cttLoot.DBByItemId = {}  -- numeric item id     → { name, boss }
-                         -- ALL ids stored since same id can map to different items
+cttLoot.DBByName          = {}  -- lowercase item name → { boss }
+cttLoot.DBByBoss          = {}  -- boss name           → { itemName, ... }
+cttLoot.DBByItemId        = {}  -- numeric item id     → { name, boss }
+                                -- ALL ids stored since same id can map to different items
+cttLoot.DBByEncounterId   = {}  -- encounter id (num)  → boss name  (O(1) ResolveBoss)
+cttLoot.DBByBossLower     = {}  -- lowercase boss name → canonical boss name
 
 local function BuildDBLookups()
   for key, entry in pairs(cttLoot.DB) do
@@ -21,6 +23,10 @@ local function BuildDBLookups()
         cttLoot.DBByBoss[entry.boss] = {}
       end
       table.insert(cttLoot.DBByBoss[entry.boss], entry.name)
+      cttLoot.DBByBossLower[entry.boss:lower()] = entry.boss
+    end
+    if entry.encounterId then
+      cttLoot.DBByEncounterId[entry.encounterId] = entry.boss
     end
     -- Extract numeric ID from compound key "id_name" — store every id
     local numId = tonumber(key:match("^(%d+)_"))
@@ -43,8 +49,12 @@ function cttLoot:GetItemInfo(itemName)
   return self.DBByName[(itemName or ""):lower()]
 end
 
+-- Cached boss list — invalidated by InvalidateDBCaches()
+local allBossesCache = nil
+
 -- Returns a sorted list of all boss names that have DB entries
 function cttLoot:GetAllBosses()
+  if allBossesCache then return allBossesCache end
   local seen   = {}
   local result = {}
   for _, entry in pairs(self.DB) do
@@ -54,7 +64,13 @@ function cttLoot:GetAllBosses()
     end
   end
   table.sort(result)
+  allBossesCache = result
   return result
+end
+
+-- Called after DB changes to drop all derived caches
+function cttLoot:InvalidateDBCaches()
+  allBossesCache = nil
 end
 
 -- Returns item names that drop from a specific boss
@@ -104,6 +120,8 @@ function cttLoot:MergeCustomDB()
         wipe(cttLoot.DBByName)
         wipe(cttLoot.DBByBoss)
         wipe(cttLoot.DBByItemId)
+        wipe(cttLoot.DBByEncounterId)
+        wipe(cttLoot.DBByBossLower)
         for key, entry in pairs(cttLoot.DB) do
             local nameLower = (entry.name or ""):lower()
             if nameLower ~= "" then
@@ -120,6 +138,10 @@ function cttLoot:MergeCustomDB()
                 if not found then
                     table.insert(cttLoot.DBByBoss[entry.boss], entry.name)
                 end
+                cttLoot.DBByBossLower[entry.boss:lower()] = entry.boss
+            end
+            if entry.encounterId then
+                cttLoot.DBByEncounterId[entry.encounterId] = entry.boss
             end
             local numId = tonumber(key:match("^(%d+)_"))
             if numId then
@@ -129,6 +151,7 @@ function cttLoot:MergeCustomDB()
                 table.insert(cttLoot.DBByItemId[numId], { name = entry.name, boss = entry.boss })
             end
         end
+        cttLoot:InvalidateDBCaches()
         cttLoot:Print(string.format("Loaded %d custom DB entries.", count))
     end
 end

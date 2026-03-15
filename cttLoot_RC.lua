@@ -34,17 +34,18 @@ local function MatchItemName(rcName)
     if not rcName or #cttLoot.itemNames == 0 then return nil end
     local rcLower = rcName:lower()
 
-    -- 1. Exact match (case-insensitive)
-    for _, name in ipairs(cttLoot.itemNames) do
-        if name:lower() == rcLower then return name end
-    end
-    -- 2. RC name contains cttLoot name
-    for _, name in ipairs(cttLoot.itemNames) do
-        if rcLower:find(name:lower(), 1, true) then return name end
+    -- 1. O(1) exact match via cached lowercase lookup
+    local exact = cttLoot.itemIndexLower[rcLower]
+    if exact then return exact end
+
+    -- 2. RC name contains cttLoot name (uses pre-lowered array)
+    local namesLower = cttLoot.itemNamesLower
+    for i, nameLower in ipairs(namesLower) do
+        if rcLower:find(nameLower, 1, true) then return cttLoot.itemNames[i] end
     end
     -- 3. cttLoot name contains RC name
-    for _, name in ipairs(cttLoot.itemNames) do
-        if name:lower():find(rcLower, 1, true) then return name end
+    for i, nameLower in ipairs(namesLower) do
+        if nameLower:find(rcLower, 1, true) then return cttLoot.itemNames[i] end
     end
     return nil
 end
@@ -52,6 +53,7 @@ end
 -- ── Apply RC session filter via public UI API only ────────────────────────────
 local function ApplyRCSessionFilter(session)
     if not RCLootCouncil then return end
+    if #cttLoot.itemNames == 0 then return end
 
     local lootTable = RCLootCouncil:GetLootTable()
     if not lootTable or not lootTable[session] then return end

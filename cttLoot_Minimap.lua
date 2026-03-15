@@ -128,6 +128,7 @@ local function Build()
     end)
 
     -- Drag
+    local function ResetMoving() isMoving = false end
     btn:SetScript("OnDragStart", function(self)
         isMoving = true
         self:LockHighlight()
@@ -137,7 +138,7 @@ local function Build()
     btn:SetScript("OnDragStop", function(self)
         self:SetScript("OnUpdate", nil)
         self:UnlockHighlight()
-        C_Timer.After(0, function() isMoving = false end)
+        C_Timer.After(0, ResetMoving)
     end)
 
     UpdatePosition()
