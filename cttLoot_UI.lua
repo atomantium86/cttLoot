@@ -292,6 +292,36 @@ local function BuildClassColors()
     end
 end
 
+-- Per-player session award flag: { ["PlayerName"] = true } if they received
+-- any loot this RC session.  Cleared automatically when new parse data is
+-- imported (cttLoot_RC.ClearAwards fires → onDataApplied → awardsDirty).
+local awardedSet = {}
+
+local function BuildAwardedSet()
+    awardedSet = cttLoot:GetAwardedPlayers()
+end
+
+-- Dirty flags — set true when the underlying data changes, cleared after rebuild.
+-- Refresh() checks these instead of rebuilding unconditionally every render.
+local classColorsDirty = true   -- rebuild on first Refresh and on GROUP_ROSTER_UPDATE
+local awardsDirty      = true   -- rebuild on first Refresh, on new award, on data import
+
+local function RebuildIfDirty()
+    if classColorsDirty then
+        BuildClassColors()
+        classColorsDirty = false
+    end
+    if awardsDirty then
+        BuildAwardedSet()
+        awardsDirty = false
+    end
+end
+
+-- Called by cttLoot_RC after each award so the next Refresh picks it up.
+function cttLoot_UI.MarkAwardsDirty()
+    awardsDirty = true
+end
+
 local function GetClassColor(playerName)
     local key = playerName:lower():match("^([^%-]+)") or playerName:lower()
     return classColorCache[key]
@@ -438,7 +468,7 @@ local function BuildImportSection(drawer_)
         if not raw or raw == "" then return end
         local data, err = cttLoot:ParseCSV(raw)
         if not data then cttLoot:Print("Parse error: "..(err or "?")); return end
-        cttLoot:ApplyData(data)
+        cttLoot:ApplyData(data, true)
         cttLootDB.lastData = { itemNames=data.itemNames, playerNames=data.playerNames, matrix=data.matrix }
         cttLoot:Print(string.format("Loaded %d items x %d players.", #data.itemNames, #data.playerNames))
         cttLoot_UI:Refresh()
@@ -460,7 +490,7 @@ local function BuildImportSection(drawer_)
     clearBtn:SetScript("OnClick", function()
         eb:SetText("")
         cttLootDB.lastData = nil
-        cttLoot:ApplyData({ itemNames={}, playerNames={}, matrix={} })
+        cttLoot:ApplyData({ itemNames={}, playerNames={}, matrix={} }, true)
         cttLoot_UI.selectedBoss = nil
         cttLoot_UI.selectedItem = nil
         cttLoot_UI.lootFilter   = nil
@@ -1055,7 +1085,7 @@ function cttLoot_UI:RefreshHistoryTab()
             nameFS:SetJustifyH("LEFT"); nameFS:SetJustifyV("MIDDLE")
             local cc = GetClassColor(row.player)
             if row.isCat then
-                nameFS:SetText(row.player .. " " .. Clr(C.catalyst, "(cat)"))
+                nameFS:SetText(Clr(C.catalyst, "*") .. " " .. row.player)
                 if cc then nameFS:SetTextColor(cc[1],cc[2],cc[3]) else nameFS:SetTextColor(RGB(C.text)) end
             else
                 nameFS:SetText(row.player)
@@ -1222,7 +1252,7 @@ function cttLoot_UI:RefreshHistoryTab()
             nameFS:SetJustifyH("LEFT"); nameFS:SetJustifyV("MIDDLE")
             local cc = GetClassColor(row.player)
             if row.isCat then
-                nameFS:SetText(row.player .. " " .. Clr(C.catalyst, "(cat)"))
+                nameFS:SetText(Clr(C.catalyst, "*") .. " " .. row.player)
             else
                 nameFS:SetText(row.player)
             end
@@ -1618,15 +1648,13 @@ local function GetItemPool()
     local playerRow = selectedPlayer and cttLoot.matrix[cttLoot.playerIndex[selectedPlayer]]
     for _, n in ipairs(source) do
         if not IsCatalyst(n) then
-            if true then
-                if selectedPlayer then
-                    local ci = cttLoot.itemIndex[n]
-                    if ci and playerRow and playerRow[ci] then
-                        table.insert(pool, n)
-                    end
-                else
+            if selectedPlayer then
+                local ci = cttLoot.itemIndex[n]
+                if ci and playerRow and playerRow[ci] then
                     table.insert(pool, n)
                 end
+            else
+                table.insert(pool, n)
             end
         end
     end
@@ -1824,8 +1852,9 @@ local function ConfigureCard(card, itemName, entries, maxAbs, ox, oy, cardW, hdr
         local slot = p.rows[i]
         local e    = entries[i]
         if e then
-            local ry     = hdrH + (i - 1) * ROW_H
-            local isBest = not e.isCat and (playerBestItem[e.player] == itemName)
+            local ry      = hdrH + (i - 1) * ROW_H
+            local isBest  = not e.isCat and (playerBestItem[e.player] == itemName)
+            local wasAwarded = awardedSet[e.player]
 
             if isBest then
                 slot.bestBg:SetSize(cardW, ROW_H)
@@ -1853,12 +1882,17 @@ local function ConfigureCard(card, itemName, entries, maxAbs, ox, oy, cardW, hdr
             slot.nameFS:SetPoint("TOPLEFT", card, "TOPLEFT", COL_RANK + 2, -ry)
             local cc = GetClassColor(e.player)
             if e.isCat then
-                slot.nameFS:SetText(e.player .. " " .. Clr(C.catalyst, "(cat)"))
+                slot.nameFS:SetText(Clr(C.catalyst, "*") .. " " .. e.player)
             else
                 slot.nameFS:SetText(e.player)
             end
-            if cc then slot.nameFS:SetTextColor(cc[1], cc[2], cc[3])
-            else       slot.nameFS:SetTextColor(RGB(C.text)) end
+            if cc then
+                if wasAwarded then slot.nameFS:SetTextColor(cc[1]*0.5, cc[2]*0.5, cc[3]*0.5)
+                else               slot.nameFS:SetTextColor(cc[1], cc[2], cc[3]) end
+            else
+                if wasAwarded then slot.nameFS:SetTextColor(RGB(C.text_dim))
+                else               slot.nameFS:SetTextColor(RGB(C.text)) end
+            end
             slot.nameFS:Show()
 
             slot.barBg:SetSize(dynBarW, BAR_H)
@@ -1872,18 +1906,32 @@ local function ConfigureCard(card, itemName, entries, maxAbs, ox, oy, cardW, hdr
             slot.barFill:SetSize(fillW, BAR_H)
             slot.barFill:ClearAllPoints()
             slot.barFill:SetPoint("TOPLEFT", slot.barBg, "TOPLEFT", 0, 0)
-            if e.isCat then         slot.barFill:SetVertexColor(RGB(C.catalyst))
-            elseif e.dps >= 0 then  slot.barFill:SetVertexColor(RGB(C.green))
-            else                    slot.barFill:SetVertexColor(RGB(C.red)) end
+            if e.isCat then
+                if wasAwarded then slot.barFill:SetVertexColor(0.273, 0.153, 0.369)   -- muted purple
+                else               slot.barFill:SetVertexColor(RGB(C.catalyst)) end
+            elseif e.dps >= 0 then
+                if wasAwarded then slot.barFill:SetVertexColor(0.169, 0.330, 0.169)   -- muted green
+                else               slot.barFill:SetVertexColor(RGB(C.green)) end
+            else
+                if wasAwarded then slot.barFill:SetVertexColor(0.375, 0.128, 0.128)   -- muted red
+                else               slot.barFill:SetVertexColor(RGB(C.red)) end
+            end
             slot.barFill:Show()
 
             slot.dpsFS:ClearAllPoints()
             slot.dpsFS:SetPoint("TOPRIGHT", card, "TOPRIGHT", -4, -ry)
             local sign = e.dps >= 0 and "+" or ""
             slot.dpsFS:SetText(string.format("%s%.0f", sign, e.dps))
-            if e.isCat then         slot.dpsFS:SetTextColor(RGB(C.catalyst))
-            elseif e.dps >= 0 then  slot.dpsFS:SetTextColor(RGB(C.green))
-            else                    slot.dpsFS:SetTextColor(RGB(C.red)) end
+            if e.isCat then
+                if wasAwarded then slot.dpsFS:SetTextColor(0.273, 0.153, 0.369)
+                else               slot.dpsFS:SetTextColor(RGB(C.catalyst)) end
+            elseif e.dps >= 0 then
+                if wasAwarded then slot.dpsFS:SetTextColor(0.169, 0.330, 0.169)
+                else               slot.dpsFS:SetTextColor(RGB(C.green)) end
+            else
+                if wasAwarded then slot.dpsFS:SetTextColor(0.375, 0.128, 0.128)
+                else               slot.dpsFS:SetTextColor(RGB(C.red)) end
+            end
             slot.dpsFS:Show()
 
             if i < #entries then
@@ -2053,13 +2101,24 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         nameFS:SetPoint("TOPLEFT", card, "TOPLEFT", COL_RANK + 2, -ry)
         nameFS:SetJustifyH("LEFT"); nameFS:SetJustifyV("MIDDLE")
         local classColor = GetClassColor(e.player)
+        local wasAwarded = awardedSet[e.player]
         if e.isCat then
-            nameFS:SetText(e.player .. " " .. Clr(C.catalyst, "(cat)"))
-            if classColor then nameFS:SetTextColor(classColor[1], classColor[2], classColor[3])
-            else nameFS:SetTextColor(RGB(C.text)) end
+            nameFS:SetText(Clr(C.catalyst, "*") .. " " .. e.player)
+            if classColor then
+                if wasAwarded then nameFS:SetTextColor(classColor[1]*0.5, classColor[2]*0.5, classColor[3]*0.5)
+                else               nameFS:SetTextColor(classColor[1], classColor[2], classColor[3]) end
+            else
+                if wasAwarded then nameFS:SetTextColor(RGB(C.text_dim))
+                else               nameFS:SetTextColor(RGB(C.text)) end
+            end
         else
-            if classColor then nameFS:SetTextColor(classColor[1], classColor[2], classColor[3])
-            else nameFS:SetTextColor(RGB(C.text)) end
+            if classColor then
+                if wasAwarded then nameFS:SetTextColor(classColor[1]*0.5, classColor[2]*0.5, classColor[3]*0.5)
+                else               nameFS:SetTextColor(classColor[1], classColor[2], classColor[3]) end
+            else
+                if wasAwarded then nameFS:SetTextColor(RGB(C.text_dim))
+                else               nameFS:SetTextColor(RGB(C.text)) end
+            end
             nameFS:SetText(e.player)
         end
 
@@ -2074,12 +2133,16 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         local barFill = FlatTex(card, "ARTWORK", 1, 1, 1, 0.85)
         barFill:SetSize(fillW, BAR_H)
         barFill:SetPoint("TOPLEFT", barBg, "TOPLEFT", 0, 0)
+        local wasAwarded = awardedSet[e.player]
         if e.isCat then
-            barFill:SetVertexColor(RGB(C.catalyst))
+            if wasAwarded then barFill:SetVertexColor(0.273, 0.153, 0.369)
+            else               barFill:SetVertexColor(RGB(C.catalyst)) end
         elseif e.dps >= 0 then
-            barFill:SetVertexColor(RGB(C.green))
+            if wasAwarded then barFill:SetVertexColor(0.169, 0.330, 0.169)
+            else               barFill:SetVertexColor(RGB(C.green)) end
         else
-            barFill:SetVertexColor(RGB(C.red))
+            if wasAwarded then barFill:SetVertexColor(0.375, 0.128, 0.128)
+            else               barFill:SetVertexColor(RGB(C.red)) end
         end
 
         local dpsFS = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
@@ -2089,11 +2152,14 @@ local function MakeCard(itemName, ox, oy, limit, cardW)
         local sign = e.dps >= 0 and "+" or ""
         dpsFS:SetText(string.format("%s%.0f", sign, e.dps))
         if e.isCat then
-            dpsFS:SetTextColor(RGB(C.catalyst))
+            if wasAwarded then dpsFS:SetTextColor(0.273, 0.153, 0.369)
+            else               dpsFS:SetTextColor(RGB(C.catalyst)) end
         elseif e.dps >= 0 then
-            dpsFS:SetTextColor(RGB(C.green))
+            if wasAwarded then dpsFS:SetTextColor(0.169, 0.330, 0.169)
+            else               dpsFS:SetTextColor(RGB(C.green)) end
         else
-            dpsFS:SetTextColor(RGB(C.red))
+            if wasAwarded then dpsFS:SetTextColor(0.375, 0.128, 0.128)
+            else               dpsFS:SetTextColor(RGB(C.red)) end
         end
 
         if i < #entries then
@@ -2227,9 +2293,17 @@ local function ReflowCards()
 
     local gridW = cardScrollF:GetWidth() - 4
     if gridW < 10 then return end  -- scroll frame not yet settled; bail
-    local cardW = cttLoot_UI.selectedItem and (gridW - PAD * 2) or CARD_W
-    local cols  = cttLoot_UI.selectedItem and 1
-               or math.max(1, math.floor((gridW + CARD_GAP) / (CARD_W + CARD_GAP)))
+
+    -- Detail view: cardW = gridW - PAD*2, so all internal bar sizes (barBg,
+    -- barFill, dpsFS) must recalculate from the new cardW.  Only one card
+    -- exists here so a full Refresh is cheap.
+    if cttLoot_UI.selectedItem then
+        cttLoot_UI:Refresh()
+        return
+    end
+
+    local cardW = CARD_W
+    local cols  = math.max(1, math.floor((gridW + CARD_GAP) / (CARD_W + CARD_GAP)))
 
     -- If column count changed the layout is structurally different — need full rebuild.
     -- This is rare (only when window width crosses a column boundary).
@@ -2416,8 +2490,14 @@ FillDdList = function(listContent, listW, rows, query)
     local maxW   = listW
     local active = {}   -- buttons shown this pass
 
-    -- First pass: measure max width needed
-    local measurer = listContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    -- First pass: measure max width needed.
+    -- Reuse a single measurer FontString stored on the frame — created once,
+    -- never accumulates across repeated dropdown opens or keystrokes.
+    if not listContent._measurer then
+        listContent._measurer = listContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        listContent._measurer:Hide()
+    end
+    local measurer = listContent._measurer
     for _, row in ipairs(rows) do
         if q == "" or row.label:lower():find(q, 1, true) then
             measurer:SetText(row.label)
@@ -2425,7 +2505,7 @@ FillDdList = function(listContent, listW, rows, query)
             if tw > maxW then maxW = tw end
         end
     end
-    measurer:Hide()
+    measurer:SetText("")
 
     -- Second pass: reuse or create buttons
     local recycleIdx = 1
@@ -2441,8 +2521,11 @@ FillDdList = function(listContent, listW, rows, query)
                 btn:SetHeight(DD_ROW_H)
                 btn:ClearAllPoints()
                 btn:SetPoint("TOPLEFT", listContent, "TOPLEFT", 0, -y)
-                btn._bg:SetVertexColor(
-                    row.selected and RGB(C.accent2) or RGB(C.bg3))
+                if row.selected then
+                    btn._bg:SetVertexColor(RGB(C.accent2))
+                else
+                    btn._bg:SetVertexColor(RGB(C.bg3))
+                end
                 btn:SetScript("OnClick", row.onSelect)
                 btn:Show()
             else
@@ -2759,7 +2842,7 @@ end
 
 function cttLoot_UI:Refresh()
     if not window then return end
-    BuildClassColors()
+    RebuildIfDirty()
     if activeTab == "history" then
         self:RefreshHistoryTab()
     else
@@ -3221,17 +3304,28 @@ end
 -- Init on login
 local initFrame = CreateFrame("Frame")
 initFrame:RegisterEvent("PLAYER_LOGIN")
-initFrame:SetScript("OnEvent", function()
+initFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
+initFrame:SetScript("OnEvent", function(_, event)
+    if event == "GROUP_ROSTER_UPDATE" then
+        classColorsDirty = true
+        -- Refresh only if the window is open so we don't waste work
+        if window and window:IsShown() then cttLoot_UI:Refresh() end
+        return
+    end
+    -- PLAYER_LOGIN
     local ok, err = pcall(function() cttLoot_UI:Build() end)
     if not ok then
         cttLoot:Print("|cffff4444cttLoot UI build error: " .. tostring(err) .. "|r")
         if _G["cttLootFrame"] then _G["cttLootFrame"]:Hide() end
         return
     end
-    -- Rebuild playerBestItem whenever parse data changes, not on every grid render
+    -- Mark dirty on data change so Refresh rebuilds only when needed
     cttLoot.onDataApplied = function()
         BuildPlayerBestItems()
+        awardsDirty = true
     end
     BuildPlayerBestItems()
+    -- classColorsDirty and awardsDirty are already true from declaration;
+    -- RebuildIfDirty() inside Refresh() below will handle the first build.
     cttLoot_UI:Refresh()
 end)

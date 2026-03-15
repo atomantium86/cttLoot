@@ -115,7 +115,7 @@ function cttLoot:ParseCSV(raw)
 end
 
 -- ── Apply parsed data ─────────────────────────────────────────────────────────
-function cttLoot:ApplyData(data)
+function cttLoot:ApplyData(data, resetAwards)
     self.itemNames = data.itemNames
     for i, name in ipairs(data.playerNames) do
         data.playerNames[i] = name:sub(1,1):upper()..name:sub(2)
@@ -127,7 +127,7 @@ function cttLoot:ApplyData(data)
     for i, v in ipairs(self.itemNames)   do self.itemIndex[v]   = i end
     for i, v in ipairs(self.playerNames) do self.playerIndex[v] = i end
     if self.onDataApplied then self.onDataApplied() end
-    if cttLoot_RC and cttLoot_RC.ClearAwards then cttLoot_RC.ClearAwards() end
+    if resetAwards and cttLoot_RC and cttLoot_RC.ClearAwards then cttLoot_RC.ClearAwards() end
 end
 
 -- ── Serialisation ─────────────────────────────────────────────────────────────
@@ -379,7 +379,7 @@ local function OnAddonMessage(_, prefix, message, channel, sender)
         end
         cttLoot:Print(string.format("Received data from %s: %d items x %d players, %d values, payload=%d bytes",
             sender,#parsed.itemNames,#parsed.playerNames,nonNil,#fullPayload))
-        cttLoot:ApplyData(parsed)
+        cttLoot:ApplyData(parsed, true)
         -- Reset view state via public API only
         if cttLoot_UI then
             cttLoot_UI:SetBossFilter(nil)
@@ -612,6 +612,15 @@ function cttLoot:GetWinnerForItem(itemName)
         return cttLoot_RC.GetWinnerForItem(itemName)
     end
     return nil
+end
+
+-- Returns a player-keyed set of everyone awarded an item this RC session.
+-- Empty table when RC is not in use.  Cleared automatically on new import.
+function cttLoot:GetAwardedPlayers()
+    if cttLoot_RC and cttLoot_RC.GetAwardedPlayers then
+        return cttLoot_RC.GetAwardedPlayers()
+    end
+    return {}
 end
 
 -- ── Print helper ──────────────────────────────────────────────────────────────

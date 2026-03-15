@@ -103,6 +103,22 @@ local function AddWinner(itemKey, name)
         if v == name then return end
     end
     table.insert(awardedItems[itemKey], name)
+    -- Persist so the muted-color state survives /reload
+    if cttLootDB then cttLootDB.awardedItems = awardedItems end
+    -- Signal UI to rebuild awardedSet on next Refresh
+    if cttLoot_UI and cttLoot_UI.MarkAwardsDirty then cttLoot_UI.MarkAwardsDirty() end
+end
+
+-- Returns a set { ["PlayerName"] = true } of every player who received an
+-- award this session, regardless of which item.  Called via cttLoot facade.
+function cttLoot_RC.GetAwardedPlayers()
+    local set = {}
+    for _, winners in pairs(awardedItems) do
+        for _, name in ipairs(winners) do
+            set[name] = true
+        end
+    end
+    return set
 end
 
 -- Read-only accessor called by cttLoot:GetWinnerForItem() facade.
@@ -181,6 +197,8 @@ end
 
 function cttLoot_RC.ClearAwards()
     awardedItems = {}
+    if cttLootDB then cttLootDB.awardedItems = nil end
+    if cttLoot_UI and cttLoot_UI.MarkAwardsDirty then cttLoot_UI.MarkAwardsDirty() end
     if cttLoot_UI and cttLoot_UI.ResetAwardFilter then cttLoot_UI:ResetAwardFilter() end
     if cttLoot_UI and cttLoot_UI.Refresh          then cttLoot_UI:Refresh() end
 end
@@ -188,6 +206,16 @@ end
 -- ── Initialise ────────────────────────────────────────────────────────────────
 function cttLoot_RC:Init()
     if not RCLootCouncil then return end
+
+    -- Restore persisted award state so muted colors survive /reload.
+    -- ClearAwards (fired on new import) wipes cttLootDB.awardedItems,
+    -- so this never outlasts a fresh paste.
+    if cttLootDB and cttLootDB.awardedItems then
+        awardedItems = cttLootDB.awardedItems
+        -- BuildAwardedSet already ran at login before this 1-second delay,
+        -- so we need a fresh Refresh to pick up the restored state.
+        if cttLoot_UI and cttLoot_UI.Refresh then cttLoot_UI:Refresh() end
+    end
 
     local RC            = RCLootCouncil
     local pendingSession = nil
@@ -256,6 +284,8 @@ function cttLoot_RC:SetEnabled(val)
     if not val then
         awardedItems  = {}
         activeSession = nil
+        if cttLootDB then cttLootDB.awardedItems = nil end
+        if cttLoot_UI and cttLoot_UI.MarkAwardsDirty then cttLoot_UI.MarkAwardsDirty() end
         cttLoot_UI:SetLootFilter(nil)
         cttLoot_UI:SetSelectedItem(nil)
         cttLoot_UI:Refresh()
