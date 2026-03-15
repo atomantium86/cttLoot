@@ -1,8 +1,8 @@
 -- cttLoot_RCSim.lua
 -- Simulates an RCLootCouncil voting session using real Midnight Season 1 raid items.
 -- Usage: /cttloot rcsim [boss]
---   No argument  → picks a random boss across all three Season 1 raids
---   boss name    → runs a specific boss (substring match)
+--   No argument  -> picks a random boss across all three Season 1 raids
+--   boss name    -> runs a specific boss (substring match)
 --
 -- ALL item IDs verified from Wowhead live/beta database search results (patch 12.0.1).
 -- Source NPC names match Wowhead item pages exactly.
@@ -112,7 +112,7 @@ local RAIDS = {
         },
     },
     {
-        -- Crown of the Cosmos — boss is Alleria Windrunner
+        -- Crown of the Cosmos - boss is Alleria Windrunner
         raid = "The Voidspire",
         boss = "Crown of the Cosmos",
         items = {
@@ -250,7 +250,7 @@ end
 local function InjectIntoRC(bossData, picked)
     local ML = RCLootCouncil:GetActiveModule("masterlooter")
     if not ML then
-        cttLoot:Print("rcsim: RC loaded but you are not Master Looter — skipping RC inject.")
+        cttLoot:Print("rcsim: RC loaded but you are not Master Looter - skipping RC inject.")
         return
     end
 
@@ -322,7 +322,7 @@ function cttLoot_RCSim:Run(bossFilter)
     local fakeTable = BuildFakeLootTable(bossData, count)
 
     cttLoot:Print(string.format(
-        "rcsim → |cff69CCF0%s|r / |cffffd700%s|r  (%d items)",
+        "rcsim -> |cff69CCF0%s|r / |cffffd700%s|r  (%d items)",
         bossData.raid, bossData.boss, #fakeTable))
 
     -- Inject into live RC session if RC is available

@@ -54,9 +54,9 @@ cttLoot.itemIndex   = {}   -- name -> index  (O(1))
 cttLoot.playerIndex = {}   -- name -> index  (O(1))
 
 -- Derived caches (rebuilt by ApplyData; safe to read as empty tables before load)
-cttLoot.itemIndexLower = {}   -- lowercase name → original name
-cttLoot.catalystSet    = {}   -- catalyst item name → true
-cttLoot.catColIndex    = {}   -- item name → catalyst column index
+cttLoot.itemIndexLower = {}   -- lowercase name -> original name
+cttLoot.catalystSet    = {}   -- catalyst item name -> true
+cttLoot.catColIndex    = {}   -- item name -> catalyst column index
 cttLoot.itemNamesLower = {}   -- parallel array of lowered item names
 
 -- ── Saved vars defaults ───────────────────────────────────────────────────────
@@ -158,7 +158,7 @@ function cttLoot:ApplyData(data, resetAwards)
     for i, v in ipairs(self.playerNames) do self.playerIndex[v] = i end
 
     -- ── Derived caches (only change when data is imported) ──
-    -- lowercase item name → original name  (O(1) lookups in MatchItemName, OpenLootUI, etc.)
+    -- lowercase item name -> original name  (O(1) lookups in MatchItemName, OpenLootUI, etc.)
     self.itemIndexLower = {}
     for _, v in ipairs(self.itemNames) do self.itemIndexLower[v:lower()] = v end
 
@@ -168,7 +168,7 @@ function cttLoot:ApplyData(data, resetAwards)
         if name:upper():sub(-9) == " CATALYST" then self.catalystSet[name] = true end
     end
 
-    -- item name → catalyst column index (avoids string concat per CatColFor call)
+    -- item name -> catalyst column index (avoids string concat per CatColFor call)
     self.catColIndex = {}
     for _, name in ipairs(self.itemNames) do
         if not self.catalystSet[name] then
@@ -303,15 +303,15 @@ function cttLoot:Broadcast(channel)
     local prefix = compressed and "C" or ""
     local numChunks = math.ceil(#payload/self.CHUNK_SIZE)
     if compressed then
-        cttLoot:Print(string.format("Sending %d bytes → %d compressed (%d%% ratio, %d chunks) on %s — ETA %ds...",
+        cttLoot:Print(string.format("Sending %d bytes -> %d compressed (%d%% ratio, %d chunks) on %s - ETA %ds...",
             #raw, #payload, math.floor(#payload/#raw*100), numChunks, channel, math.max(1, numChunks - 10)))
     else
-        cttLoot:Print(string.format("Sending %d bytes (%d chunks) on %s — ETA %ds...%s",
+        cttLoot:Print(string.format("Sending %d bytes (%d chunks) on %s - ETA %ds...%s",
             #raw, numChunks, channel, math.max(1, numChunks - 10),
-            not LibDeflate and "  |cffff8800LibDeflate failed to load — compression disabled.|r" or ""))
+            not LibDeflate and "  |cffff8800LibDeflate failed to load - compression disabled.|r" or ""))
     end
     if channel=="WHISPER" then
-        cttLoot:Print("|cffff8800Warning: not in a group — sending to self only.|r")
+        cttLoot:Print("|cffff8800Warning: not in a group - sending to self only.|r")
     end
     BroadcastChunked(payload, prefix, channel, target, function(total)
         cttLoot:Print(string.format("Broadcast %d items x %d players to %s in %d chunk(s). Done.",
@@ -364,15 +364,15 @@ function cttLoot:BroadcastDB(channel)
     local prefix = compressed and "DBC:" or "DB:"
     local numChunks = math.ceil(#payload/self.CHUNK_SIZE)
     if compressed then
-        cttLoot:Print(string.format("Sending DB (%d entries, %d→%d bytes, %d chunks) on %s — ETA %ds...",
+        cttLoot:Print(string.format("Sending DB (%d entries, %d->%d bytes, %d chunks) on %s - ETA %ds...",
             count, #raw, #payload, numChunks, channel, math.max(1, numChunks - 10)))
     else
-        cttLoot:Print(string.format("Sending DB (%d entries, %d bytes, %d chunks) on %s — ETA %ds...%s",
+        cttLoot:Print(string.format("Sending DB (%d entries, %d bytes, %d chunks) on %s - ETA %ds...%s",
             count, #raw, numChunks, channel, math.max(1, numChunks - 10),
-            not LibDeflate and "  |cffff8800LibDeflate failed to load — compression disabled.|r" or ""))
+            not LibDeflate and "  |cffff8800LibDeflate failed to load - compression disabled.|r" or ""))
     end
     if channel=="WHISPER" then
-        cttLoot:Print("|cffff8800Warning: not in a group — sending to self only.|r")
+        cttLoot:Print("|cffff8800Warning: not in a group - sending to self only.|r")
     end
     BroadcastChunked(payload, prefix, channel, target, function(total)
         cttLoot:Print(string.format("Sent item DB (%d entries) to %s in %d chunk(s). Done.",count,channel,total))
@@ -432,8 +432,8 @@ local inboundDBBuffers = {}
 -- Timeout timers: if chunk assembly doesn't complete within the expected
 -- transfer window, warn the user and clear the stale buffer.  Without
 -- this, a single dropped chunk causes the receiver to hang silently forever.
-local inboundTimeouts   = {}   -- sender → timer
-local inboundDBTimeouts = {}   -- sender → timer
+local inboundTimeouts   = {}   -- sender -> timer
+local inboundDBTimeouts = {}   -- sender -> timer
 local RECEIVE_TIMEOUT   = 150  -- seconds; 125 chunks at 1/sec sustained = ~115s, 150s gives safe margin
 
 local function OnAddonMessage(_, prefix, message, channel, sender)
@@ -470,7 +470,7 @@ local function OnAddonMessage(_, prefix, message, channel, sender)
         return
     end
 
-    -- Compressed DB chunks (DBC: prefix — must be checked before DB:)
+    -- Compressed DB chunks (DBC: prefix - must be checked before DB:)
     if message:sub(1,4)=="DBC:" then
         local idx,total,data=message:match("^DBC:(%d+)/(%d+):(.*)$")
         idx=tonumber(idx); total=tonumber(total)
@@ -515,7 +515,7 @@ local function OnAddonMessage(_, prefix, message, channel, sender)
             if cttLoot_UI and cttLoot_UI.PopulateBossDropdown then
                 cttLoot_UI:PopulateBossDropdown()
             end
-            cttLoot:Print(string.format("Received compressed DB from %s: %d→%d bytes, %d entries.",
+            cttLoot:Print(string.format("Received compressed DB from %s: %d->%d bytes, %d entries.",
                 sender,#encoded,#raw,cnt))
         end
         return
@@ -609,7 +609,7 @@ local function OnAddonMessage(_, prefix, message, channel, sender)
                     if parsed.matrix[r][i]~=nil then nonNil=nonNil+1 end
                 end
             end
-            cttLoot:Print(string.format("Received compressed data from %s: %d→%d bytes, %d items x %d players, %d values",
+            cttLoot:Print(string.format("Received compressed data from %s: %d->%d bytes, %d items x %d players, %d values",
                 sender,#encoded,#raw,#parsed.itemNames,#parsed.playerNames,nonNil))
             cttLoot:ApplyData(parsed, true)
             if cttLoot_UI then
@@ -699,7 +699,7 @@ local function RunTestLoot()
     for i=#pool,2,-1 do local j=math.random(i); pool[i],pool[j]=pool[j],pool[i] end
     local count=math.min(math.random(4,6),#pool)
     local loot={}; for i=1,count do loot[i]=pool[i] end
-    cttLoot:Print(string.format("[TEST] %s — %d items",bossName,count))
+    cttLoot:Print(string.format("[TEST] %s - %d items",bossName,count))
     if cttLoot_UI then
         cttLoot_UI:SetBossFilter(bossName)
         cttLoot_UI:SetLootFilter(loot)
@@ -817,7 +817,7 @@ end
 function cttLoot:RunCheck()
     if #cttLoot.itemNames==0 then cttLoot:Print("No data loaded."); return end
     local myCheck,myDBCheck=Checksum(),DBChecksum()
-    cttLoot:Print(string.format("Parse: %s  DB: %s — pinging group...",myCheck,myDBCheck))
+    cttLoot:Print(string.format("Parse: %s  DB: %s - pinging group...",myCheck,myDBCheck))
     checkResults={}
     if checkTimer then checkTimer:Cancel(); checkTimer=nil end
     local ch=IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or "WHISPER")
@@ -832,7 +832,7 @@ function cttLoot:RunCheck()
             if result.db==nil then dbStr="|cffaaaaaaDB unknown (old client)|r"
             elseif result.db  then dbStr="|cff44ff44DB OK|r"
             else                   dbStr="|cffff4444DB mismatch|r" end
-            cttLoot:Print(string.format("  %s — %s  %s",name,parseStr,dbStr))
+            cttLoot:Print(string.format("  %s - %s  %s",name,parseStr,dbStr))
         end
     end)
 end
@@ -868,7 +868,7 @@ function cttLoot:EJTest(bossArg)
     for i=#lootPool,2,-1 do local j=math.random(i); lootPool[i],lootPool[j]=lootPool[j],lootPool[i] end
     local count=math.min(math.random(3,6),#lootPool)
     local picked={}; for i=1,count do picked[i]=lootPool[i] end
-    self:Print(string.format("[EJTest] Boss %d/%d: |cffffd700%s|r — adding %d items to RC...",
+    self:Print(string.format("[EJTest] Boss %d/%d: |cffffd700%s|r - adding %d items to RC...",
         bossNum,#bosses,boss.name,count))
     local function AddToRC(itemID)
         local _,link=C_Item.GetItemInfo(itemID)
@@ -920,19 +920,19 @@ local function SlashHandler(msg)
         if cttLoot_UI then cttLoot_UI:Toggle() end
     elseif msg=="help" then
         cttLoot:Print("Commands:")
-        cttLoot:Print("  |cffffd700/cttloot show|r — toggle window")
-        cttLoot:Print("  |cffffd700/cttloot send|r — broadcast parse data to group")
-        cttLoot:Print("  |cffffd700/cttloot check|r — verify group has same data")
-        cttLoot:Print("  |cffffd700/cttloot rcsim [boss]|r — simulate RC loot session")
-        cttLoot:Print("  |cffffd700/cttloot rctest <item>|r — test RC item match")
-        cttLoot:Print("  |cffffd700/cttloot loopback|r — toggle receiving own broadcasts")
-        cttLoot:Print("  |cffffd700/cttloot sendcheck|r — test serialize/deserialize")
-        cttLoot:Print("  |cffffd700/cttloot test|r — toggle test mode")
-        cttLoot:Print("  |cffffd700/cttloot ejtest [N]|r — RC test via Encounter Journal")
-        cttLoot:Print("  |cffffd700/cttloot lootdebug|r — print loot slot debug info")
-        cttLoot:Print("  |cffffd700/cttloot unknown|r — list unmatched CSV items")
-        cttLoot:Print("  |cffffd700/cttloot reset|r — reset window position/size")
-        cttLoot:Print("  |cffffd700/cttloot awardtest <item> [>> winner]|r — simulate award")
+        cttLoot:Print("  |cffffd700/cttloot show|r - toggle window")
+        cttLoot:Print("  |cffffd700/cttloot send|r - broadcast parse data to group")
+        cttLoot:Print("  |cffffd700/cttloot check|r - verify group has same data")
+        cttLoot:Print("  |cffffd700/cttloot rcsim [boss]|r - simulate RC loot session")
+        cttLoot:Print("  |cffffd700/cttloot rctest <item>|r - test RC item match")
+        cttLoot:Print("  |cffffd700/cttloot loopback|r - toggle receiving own broadcasts")
+        cttLoot:Print("  |cffffd700/cttloot sendcheck|r - test serialize/deserialize")
+        cttLoot:Print("  |cffffd700/cttloot test|r - toggle test mode")
+        cttLoot:Print("  |cffffd700/cttloot ejtest [N]|r - RC test via Encounter Journal")
+        cttLoot:Print("  |cffffd700/cttloot lootdebug|r - print loot slot debug info")
+        cttLoot:Print("  |cffffd700/cttloot unknown|r - list unmatched CSV items")
+        cttLoot:Print("  |cffffd700/cttloot reset|r - reset window position/size")
+        cttLoot:Print("  |cffffd700/cttloot awardtest <item> [>> winner]|r - simulate award")
     elseif msg=="check" then
         cttLoot:RunCheck()
     elseif msg:sub(1,6)=="rctest" then
@@ -985,7 +985,7 @@ local function SlashHandler(msg)
     elseif msg=="test" then
         cttLoot.testMode=not cttLoot.testMode
         cttLoot.testBossIndex=1
-        cttLoot:Print(cttLoot.testMode and "Test mode ON — leave combat to cycle bosses." or "Test mode OFF.")
+        cttLoot:Print(cttLoot.testMode and "Test mode ON - leave combat to cycle bosses." or "Test mode OFF.")
     elseif msg:sub(1,6)=="ejtest" then
         local arg=msg:sub(8):match("^%s*(.-)%s*$")
         cttLoot:EJTest(arg~="" and tonumber(arg) or nil)
@@ -1024,7 +1024,7 @@ local function SlashHandler(msg)
             for _,name in ipairs(unknown) do cttLoot:Print("  "..name) end
         end
     else
-        cttLoot:Print("/cttloot help — list commands")
+        cttLoot:Print("/cttloot help - list commands")
     end
 end
 
@@ -1059,7 +1059,7 @@ frame:SetScript("OnEvent", function(_, event, ...)
             local deflateStatus = LibDeflate
                 and "|cff44ff44LibDeflate: enabled|r"
                 or  "|cffff4444LibDeflate: failed to load! Compression disabled.|r"
-            cttLoot:Print("Loaded. "..deflateStatus.." — /cttloot for commands.")
+            cttLoot:Print("Loaded. "..deflateStatus.." - /cttloot for commands.")
         end
     elseif event=="PLAYER_LOGIN" then
         C_Timer.After(1,function() cttLoot_RC:Init() end)

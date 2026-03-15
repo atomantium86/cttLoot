@@ -10,7 +10,7 @@
 --   cttLoot_UI:ResetAwardFilter()
 --
 -- Award state lives entirely inside this module.
--- cttLoot_UI reads winner data through cttLoot:GetWinnerForItem() — NOT directly from RC.
+-- cttLoot_UI reads winner data through cttLoot:GetWinnerForItem() - NOT directly from RC.
 -- cttLoot_UI NEVER accesses cttLoot_RC fields or locals.
 
 cttLoot_RC = { trackEnabled = true }
@@ -72,7 +72,7 @@ local function ApplyRCSessionFilter(session)
         end
     end
 
-    -- SetLootFilter also clears selectedItem internally — use public API
+    -- SetLootFilter also clears selectedItem internally - use public API
     if #sessionItems > 0 then
         cttLoot_UI:SetLootFilter(sessionItems)
     end
@@ -306,7 +306,7 @@ function cttLoot_RC:Test(itemName)
         cttLoot_UI:SetLootFilter(nil)
         cttLoot_UI:SetSelectedItem(matched)
         cttLoot_UI:Refresh()
-        cttLoot:Print(string.format("RC test → |cffffd700%s|r", matched))
+        cttLoot:Print(string.format("RC test -> |cffffd700%s|r", matched))
     else
         cttLoot:Print(string.format("RC test: no match for '%s'", itemName))
     end
