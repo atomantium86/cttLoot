@@ -224,17 +224,29 @@ local function Deserialize(raw)
 end
 
 -- ── Network send helpers ──────────────────────────────────────────────────────
+-- Since Patch 11.0.0 (TWW), SendAddonMessage returns Enum.SendAddonMessageResult
+-- instead of a boolean.  The deprecation wrapper shifts the enum to the second
+-- return position.  We use select(-1, ...) to reliably get the result on any
+-- client version, per the Warcraft wiki recommendation.
+local RESULT_SUCCESS = Enum and Enum.SendAddonMessageResult
+    and Enum.SendAddonMessageResult.Success or 0
+
 local function SafeSend(prefix, msg, channel, target)
     if C_ChatInfo.InChatMessagingLockdown and C_ChatInfo.InChatMessagingLockdown() then
-        cttLoot:Print("Cannot send: addon messaging restricted in instances.")
-        return false
+        return false, "lockdown"
     end
-    local ok = C_ChatInfo.SendAddonMessage(prefix, msg, channel, target)
-    if not ok then
-        cttLoot:Print(string.format("|cffff4444SendAddonMessage failed|r (channel=%s, %d bytes). Are you in a group?",
-            tostring(channel), #msg))
+    local result = select(-1, C_ChatInfo.SendAddonMessage(prefix, msg, channel, target))
+    -- Handle both legacy boolean (true/false) and modern enum (0 = Success)
+    if result == true or result == RESULT_SUCCESS then
+        return true
     end
-    return ok
+    -- Check for throttle specifically (enum value 4 in TWW)
+    local THROTTLE = Enum and Enum.SendAddonMessageResult
+        and Enum.SendAddonMessageResult.AddonMessageThrottle
+    if THROTTLE and result == THROTTLE then
+        return false, "throttle"
+    end
+    return false, tostring(result)
 end
 
 local function BroadcastChunked(payload, msgPrefix, channel, target, onDone)
@@ -243,53 +255,85 @@ local function BroadcastChunked(payload, msgPrefix, channel, target, onDone)
         chunks[#chunks+1]=payload:sub(pos, pos+cttLoot.CHUNK_SIZE-1)
         pos=pos+cttLoot.CHUNK_SIZE
     end
-    -- WoW's per-prefix throttle (Patch 4.4.0+): 10-message burst bucket,
-    -- refills at 1 message/second.  We send the first 10 instantly (burst),
-    -- then 1 per second to stay within the sustained allowance.
-    -- This matches how MRT/AceComm/ChatThrottleLib handle bulk data.
-    local BURST = 10
+    -- Two throttle systems in WoW:
+    -- 1) Per-prefix token bucket (Patch 4.4.0+): 10 burst, refills 1/sec.
+    -- 2) Global byte-rate (~2000 CPS safe, ChatThrottleLib uses 800 CPS /
+    --    4000-byte burst).  Other addons (DBM, WA, Details, MRT) share this.
+    --
+    -- Strategy matching ChatThrottleLib / AceComm BULK priority:
+    --  * Burst 8 (leave 2 tokens headroom for safety)
+    --  * Sustain at 1.5s/msg (slower than 1/sec refill, leaves room for
+    --    global throttle contention from other addons)
+    --  * RETRY on throttle (critical: never skip a chunk)
+    local BURST_COUNT  = 8     -- < 10 token bucket, leave headroom
+    local SUSTAIN_RATE = 1.5   -- seconds between messages after burst
+    local MAX_RETRIES  = 5     -- retries per chunk before giving up
     local total = #chunks
     local i = 1
     local failures = 0
+    local retries = 0
 
     -- Phase 1: send burst immediately
-    while i <= total and i <= BURST do
-        local ok = SafeSend(cttLoot.PREFIX, msgPrefix..i.."/"..total..":"..chunks[i], channel, target)
-        if not ok then failures=failures+1 end
-        i=i+1
+    while i <= total and i <= BURST_COUNT do
+        local ok, reason = SafeSend(cttLoot.PREFIX, msgPrefix..i.."/"..total..":"..chunks[i], channel, target)
+        if ok then
+            i=i+1
+        elseif reason == "throttle" and retries < MAX_RETRIES then
+            retries = retries + 1
+            -- Stop burst early, let the ticker handle the rest with backoff
+            break
+        else
+            failures=failures+1
+            i=i+1  -- skip only on hard failure (not in group, lockdown, etc.)
+        end
     end
-    if total <= BURST then
-        cttLoot:Print(string.format("  Burst sent %d/%d", total, total))
-    else
-        cttLoot:Print(string.format("  Burst sent %d/%d, sustaining 1/sec...", BURST, total))
-    end
-
-    -- Phase 2: send remaining at 1/sec
+    local burstSent = i - 1
     if i > total then
+        cttLoot:Print(string.format("  Burst sent %d/%d", burstSent, total))
         if failures>0 then
             cttLoot:Print(string.format("|cffff4444%d/%d chunks failed to send!|r",failures,total))
         end
         if onDone then onDone(total) end
         return
+    else
+        cttLoot:Print(string.format("  Burst sent %d/%d, sustaining...", burstSent, total))
     end
 
+    -- Phase 2: sustain with retry
+    retries = 0
     local ticker
-    ticker = C_Timer.NewTicker(1.0, function()
-        if i>total then
+    ticker = C_Timer.NewTicker(SUSTAIN_RATE, function()
+        if i > total then
             ticker:Cancel()
-            if failures>0 then
+            if failures > 0 then
                 cttLoot:Print(string.format("|cffff4444%d/%d chunks failed to send! Is everyone in the same group?|r",failures,total))
             end
             if onDone then onDone(total) end
             return
         end
-        local ok = SafeSend(cttLoot.PREFIX, msgPrefix..i.."/"..total..":"..chunks[i], channel, target)
-        if not ok then failures=failures+1 end
-        -- Progress feedback every 20 chunks
-        if i%20==0 then
-            cttLoot:Print(string.format("  Sending %d/%d...", i, total))
+        local ok, reason = SafeSend(cttLoot.PREFIX, msgPrefix..i.."/"..total..":"..chunks[i], channel, target)
+        if ok then
+            i = i + 1
+            retries = 0  -- reset per-chunk retry counter
+        elseif reason == "throttle" then
+            -- Don't advance i - retry this chunk on next tick
+            retries = retries + 1
+            if retries >= MAX_RETRIES then
+                cttLoot:Print(string.format("|cffff4444Chunk %d/%d throttled %d times, skipping.|r", i, total, retries))
+                failures = failures + 1
+                i = i + 1
+                retries = 0
+            end
+        else
+            -- Hard failure (not in group, lockdown, etc.)
+            failures = failures + 1
+            i = i + 1
+            retries = 0
         end
-        i=i+1
+        -- Progress feedback every 20 chunks
+        if (i-1)%20==0 and i <= total then
+            cttLoot:Print(string.format("  Sending %d/%d...", i-1, total))
+        end
     end)
 end
 
@@ -304,10 +348,10 @@ function cttLoot:Broadcast(channel)
     local numChunks = math.ceil(#payload/self.CHUNK_SIZE)
     if compressed then
         cttLoot:Print(string.format("Sending %d bytes -> %d compressed (%d%% ratio, %d chunks) on %s - ETA %ds...",
-            #raw, #payload, math.floor(#payload/#raw*100), numChunks, channel, math.max(1, numChunks - 10)))
+            #raw, #payload, math.floor(#payload/#raw*100), numChunks, channel, math.max(1, math.ceil((numChunks - 8) * 1.5))))
     else
         cttLoot:Print(string.format("Sending %d bytes (%d chunks) on %s - ETA %ds...%s",
-            #raw, numChunks, channel, math.max(1, numChunks - 10),
+            #raw, numChunks, channel, math.max(1, math.ceil((numChunks - 8) * 1.5)),
             not LibDeflate and "  |cffff8800LibDeflate failed to load - compression disabled.|r" or ""))
     end
     if channel=="WHISPER" then
@@ -365,10 +409,10 @@ function cttLoot:BroadcastDB(channel)
     local numChunks = math.ceil(#payload/self.CHUNK_SIZE)
     if compressed then
         cttLoot:Print(string.format("Sending DB (%d entries, %d->%d bytes, %d chunks) on %s - ETA %ds...",
-            count, #raw, #payload, numChunks, channel, math.max(1, numChunks - 10)))
+            count, #raw, #payload, numChunks, channel, math.max(1, math.ceil((numChunks - 8) * 1.5))))
     else
         cttLoot:Print(string.format("Sending DB (%d entries, %d bytes, %d chunks) on %s - ETA %ds...%s",
-            count, #raw, numChunks, channel, math.max(1, numChunks - 10),
+            count, #raw, numChunks, channel, math.max(1, math.ceil((numChunks - 8) * 1.5)),
             not LibDeflate and "  |cffff8800LibDeflate failed to load - compression disabled.|r" or ""))
     end
     if channel=="WHISPER" then
@@ -434,7 +478,7 @@ local inboundDBBuffers = {}
 -- this, a single dropped chunk causes the receiver to hang silently forever.
 local inboundTimeouts   = {}   -- sender -> timer
 local inboundDBTimeouts = {}   -- sender -> timer
-local RECEIVE_TIMEOUT   = 150  -- seconds; 125 chunks at 1/sec sustained = ~115s, 150s gives safe margin
+local RECEIVE_TIMEOUT   = 250  -- seconds; generous ceiling for 1.5s/chunk sustained + retries
 
 local function OnAddonMessage(_, prefix, message, channel, sender)
     if prefix~=cttLoot.PREFIX then return end
